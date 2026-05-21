@@ -19,8 +19,10 @@
 //! ```
 
 use core::ops::Range;
+use std::collections::BTreeMap;
+
 use pulldown_cmark::{
-    CodeBlockKind, Event, HeadingLevel, Options as MarkdownOptions, Parser, Tag, TagEnd,
+    Alignment, CodeBlockKind, Event, HeadingLevel, Options as MarkdownOptions, Parser, Tag, TagEnd,
 };
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -56,7 +58,7 @@ impl Document {
 }
 
 /// Configuration for parsing, normalization, and consolidation.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Options {
     /// Whether Unicode normalization should be applied before parsing.
@@ -66,6 +68,26 @@ pub struct Options {
     /// Maximum size of an equality region that may be absorbed into a nearby
     /// substitution during consolidation.
     pub absorb_equalities_up_to: usize,
+    /// When enabled, parser extensions such as tables, footnotes, task lists,
+    /// and math are turned on.
+    pub enable_extended_markdown: bool,
+    /// When enabled, comparison output emphasizes block-level change regions.
+    pub block_level_changes_only: bool,
+    /// Small gaps between change regions can be merged for UI-level grouping.
+    pub merge_adjacent_regions_up_to: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            normalize_unicode: false,
+            equate_list_kinds: false,
+            absorb_equalities_up_to: 0,
+            enable_extended_markdown: true,
+            block_level_changes_only: false,
+            merge_adjacent_regions_up_to: 1,
+        }
+    }
 }
 
 /// A normalized syntax token derived from parsed Markdown.
@@ -89,12 +111,18 @@ pub enum StructureKind {
     BlockQuote,
     Emphasis,
     Strong,
+    Strikethrough,
     Link,
     Image,
     List { ordered: bool },
     ListItem,
-    CodeSpan,
     CodeBlock,
+    Table,
+    TableHead,
+    TableRow,
+    TableCell,
+    HtmlBlock,
+    FootnoteDefinition,
 }
 
 /// Atomic tokens that do not enclose child content.
@@ -107,8 +135,24 @@ pub enum AtomKind {
     Rule,
     InlineCode(String),
     CodeBlockLanguage(Option<String>),
+    TableAlignment(Vec<TableAlignmentKind>),
     LinkDestination { destination: String, title: String },
     ImageDestination { destination: String, title: String },
+    InlineHtml(String),
+    Html(String),
+    FootnoteReference(String),
+    TaskListMarker(bool),
+    InlineMath(String),
+    DisplayMath(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum TableAlignmentKind {
+    None,
+    Left,
+    Center,
+    Right,
 }
 
 /// A normalized document ready for token-level comparison.
@@ -136,6 +180,14 @@ impl NormalizedDocument {
             .cloned()
             .map(|range| map.span_for_range(range))
             .collect()
+    }
+}
+
+impl ComparisonSet {
+    pub fn comparison_by_id(&self, alternative_id: &str) -> Option<&Comparison> {
+        self.comparison_index
+            .get(alternative_id)
+            .and_then(|index| self.comparisons.get(*index))
     }
 }
 
@@ -176,6 +228,72 @@ impl Substitution {
 pub struct Comparison {
     pub alternative_id: Option<String>,
     pub substitutions: Vec<Substitution>,
+    pub changed_regions: Vec<ChangeRegion>,
+    pub unchanged_regions: Vec<UnchangedRegion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum BlockKind {
+    Paragraph,
+    Heading,
+    BlockQuote,
+    ListItem,
+    CodeBlock,
+    TableRow,
+    HtmlBlock,
+    FootnoteDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct BlockAnchor {
+    pub block_index: usize,
+    pub block_path: Vec<usize>,
+    pub heading_path: Vec<usize>,
+    pub list_item_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ReferenceBlock {
+    pub index: usize,
+    pub kind: BlockKind,
+    pub token_range: Range<usize>,
+    pub source_range: Range<usize>,
+    pub anchor: BlockAnchor,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum ChangeWeight {
+    Small,
+    Medium,
+    Large,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ChangeRegion {
+    pub reference_range: Range<usize>,
+    pub reference_source_range: Range<usize>,
+    pub alternative_source_range: Range<usize>,
+    pub block_indices: Vec<usize>,
+    pub block_kinds: Vec<BlockKind>,
+    pub primary_anchor: Option<BlockAnchor>,
+    pub weight: ChangeWeight,
+    pub replacement: Vec<Token>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct UnchangedRegion {
+    pub reference_range: Range<usize>,
+    pub reference_source_range: Range<usize>,
+    pub block_indices: Vec<usize>,
+    pub block_kinds: Vec<BlockKind>,
+    pub primary_anchor: Option<BlockAnchor>,
 }
 
 /// One source location in a document.
@@ -242,7 +360,9 @@ impl<'a> SourceMap<'a> {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ComparisonSet {
     pub reference: NormalizedDocument,
+    pub reference_blocks: Vec<ReferenceBlock>,
     pub comparisons: Vec<Comparison>,
+    pub comparison_index: BTreeMap<String, usize>,
 }
 
 /// Errors that future parsing, normalization, and comparison steps may report.
@@ -278,7 +398,7 @@ pub fn normalize_document(
     let mut token_ranges = Vec::new();
 
     for (event, source_range) in
-        Parser::new_ext(&source, MarkdownOptions::empty()).into_offset_iter()
+        Parser::new_ext(&source, markdown_options(options)).into_offset_iter()
     {
         push_event(&mut tokens, &mut token_ranges, event, source_range, options)?;
     }
@@ -297,17 +417,7 @@ pub fn compare_pair(
     alternative: &Document,
     options: &Options,
 ) -> Result<ComparisonSet, Error> {
-    let reference = normalize_document(reference, options)?;
-    let alternative = normalize_document(alternative, options)?;
-    let substitutions = diff_documents(&reference, &alternative, options);
-
-    Ok(ComparisonSet {
-        reference,
-        comparisons: vec![Comparison {
-            alternative_id: alternative.document_id,
-            substitutions,
-        }],
-    })
+    compare_many(reference, core::slice::from_ref(alternative), options)
 }
 
 /// Compares one reference document against zero or more alternatives.
@@ -317,31 +427,39 @@ pub fn compare_many(
     options: &Options,
 ) -> Result<ComparisonSet, Error> {
     let reference = normalize_document(reference, options)?;
+    let reference_blocks = build_reference_blocks(&reference);
     let mut comparisons = Vec::with_capacity(alternatives.len());
+    let mut comparison_index = BTreeMap::new();
 
-    for alternative in alternatives {
+    for (index, alternative) in alternatives.iter().enumerate() {
         let normalized = normalize_document(alternative, options)?;
-        let substitutions = diff_documents(&reference, &normalized, options);
+        let comparison = build_comparison(&reference, &reference_blocks, &normalized, options);
 
-        comparisons.push(Comparison {
-            alternative_id: normalized.document_id,
-            substitutions,
-        });
+        if let Some(alternative_id) = &comparison.alternative_id {
+            comparison_index.insert(alternative_id.clone(), index);
+        }
+
+        comparisons.push(comparison);
     }
 
     Ok(ComparisonSet {
         reference,
+        reference_blocks,
         comparisons,
+        comparison_index,
     })
 }
 
-fn diff_documents(
+fn build_comparison(
     reference: &NormalizedDocument,
+    reference_blocks: &[ReferenceBlock],
     alternative: &NormalizedDocument,
     options: &Options,
-) -> Vec<Substitution> {
+) -> Comparison {
     let ops = capture_diff_slices(Algorithm::Myers, &reference.tokens, &alternative.tokens);
     let mut substitutions = Vec::new();
+    let mut changed_regions = Vec::new();
+    let mut unchanged_regions = Vec::new();
     let mut pending: Option<PendingSubstitution> = None;
 
     for (index, op) in ops.iter().enumerate() {
@@ -358,8 +476,23 @@ fn diff_documents(
                         .as_mut()
                         .expect("pending substitution should exist")
                         .extend(old_range, new_range);
-                } else if let Some(pending) = pending.take() {
-                    substitutions.push(pending.finish(reference, alternative));
+                } else {
+                    if let Some(pending) = pending.take() {
+                        let substitution = pending.finish(reference, alternative);
+                        substitutions.push(substitution.clone());
+                        changed_regions.push(change_region_for_substitution(
+                            &substitution,
+                            reference_blocks,
+                        ));
+                    }
+
+                    if !op.old_range().is_empty() {
+                        unchanged_regions.push(unchanged_region_for_range(
+                            op.old_range(),
+                            reference,
+                            reference_blocks,
+                        ));
+                    }
                 }
             }
             DiffTag::Delete | DiffTag::Insert | DiffTag::Replace => {
@@ -375,14 +508,324 @@ fn diff_documents(
     }
 
     if let Some(pending) = pending.take() {
-        substitutions.push(pending.finish(reference, alternative));
+        let substitution = pending.finish(reference, alternative);
+        substitutions.push(substitution.clone());
+        changed_regions.push(change_region_for_substitution(
+            &substitution,
+            reference_blocks,
+        ));
     }
 
-    substitutions
+    merge_adjacent_changed_regions(&mut changed_regions, options.merge_adjacent_regions_up_to);
+
+    if options.block_level_changes_only {
+        expand_changed_regions_to_blocks(&mut changed_regions, reference, reference_blocks);
+        substitutions.clear();
+    }
+
+    Comparison {
+        alternative_id: alternative.document_id.clone(),
+        substitutions,
+        changed_regions,
+        unchanged_regions,
+    }
 }
 
 fn has_following_change(ops: &[similar::DiffOp]) -> bool {
     ops.iter().any(|op| op.tag() != DiffTag::Equal)
+}
+
+fn markdown_options(options: &Options) -> MarkdownOptions {
+    let mut markdown_options = MarkdownOptions::empty();
+
+    if options.enable_extended_markdown {
+        markdown_options.insert(MarkdownOptions::ENABLE_TABLES);
+        markdown_options.insert(MarkdownOptions::ENABLE_FOOTNOTES);
+        markdown_options.insert(MarkdownOptions::ENABLE_TASKLISTS);
+        markdown_options.insert(MarkdownOptions::ENABLE_MATH);
+    }
+
+    markdown_options
+}
+
+fn build_reference_blocks(reference: &NormalizedDocument) -> Vec<ReferenceBlock> {
+    let mut blocks = Vec::new();
+    let mut open_blocks: Vec<OpenBlock> = Vec::new();
+    let mut active_block_indices = Vec::new();
+    let mut heading_path = Vec::new();
+    let mut list_item_counters = Vec::new();
+
+    for (index, token) in reference.tokens.iter().enumerate() {
+        match token {
+            Token::Start(StructureKind::List { .. }) => list_item_counters.push(0),
+            Token::End(StructureKind::List { .. }) => {
+                list_item_counters.pop();
+            }
+            Token::Start(kind) if block_kind_for_structure(*kind).is_some() => {
+                let block_kind = block_kind_for_structure(*kind).expect("checked");
+                let block_index = blocks.len();
+                let list_item_index = if matches!(kind, StructureKind::ListItem) {
+                    list_item_counters.last_mut().map(|counter| {
+                        *counter += 1;
+                        *counter
+                    })
+                } else {
+                    None
+                };
+
+                let effective_heading_path = if let StructureKind::Heading { level } = kind {
+                    heading_path.truncate(level.saturating_sub(1) as usize);
+                    heading_path.push(block_index);
+                    heading_path.clone()
+                } else {
+                    heading_path.clone()
+                };
+
+                let anchor = BlockAnchor {
+                    block_index,
+                    block_path: active_block_indices
+                        .iter()
+                        .copied()
+                        .chain(core::iter::once(block_index))
+                        .collect(),
+                    heading_path: effective_heading_path,
+                    list_item_index,
+                };
+
+                open_blocks.push(OpenBlock {
+                    kind: *kind,
+                    token_start: index,
+                    anchor: anchor.clone(),
+                });
+                active_block_indices.push(block_index);
+
+                blocks.push(ReferenceBlock {
+                    index: block_index,
+                    kind: block_kind,
+                    token_range: index..index,
+                    source_range: 0..0,
+                    anchor,
+                    text: String::new(),
+                });
+            }
+            Token::End(kind) if block_kind_for_structure(*kind).is_some() => {
+                if let Some(position) = open_blocks.iter().rposition(|open| open.kind == *kind) {
+                    let open = open_blocks.remove(position);
+                    active_block_indices.pop();
+                    let token_range = open.token_start..(index + 1);
+                    let source_range =
+                        source_span_for_token_range(&reference.token_ranges, token_range.clone());
+                    let text = visible_text_for_range(&reference.tokens, token_range.clone());
+
+                    if let Some(block) = blocks.get_mut(open.anchor.block_index) {
+                        block.token_range = token_range;
+                        block.source_range = source_range;
+                        block.text = text;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    blocks
+}
+
+fn block_kind_for_structure(kind: StructureKind) -> Option<BlockKind> {
+    match kind {
+        StructureKind::Paragraph => Some(BlockKind::Paragraph),
+        StructureKind::Heading { .. } => Some(BlockKind::Heading),
+        StructureKind::BlockQuote => Some(BlockKind::BlockQuote),
+        StructureKind::ListItem => Some(BlockKind::ListItem),
+        StructureKind::CodeBlock => Some(BlockKind::CodeBlock),
+        StructureKind::TableRow => Some(BlockKind::TableRow),
+        StructureKind::HtmlBlock => Some(BlockKind::HtmlBlock),
+        StructureKind::FootnoteDefinition => Some(BlockKind::FootnoteDefinition),
+        _ => None,
+    }
+}
+
+fn visible_text_for_range(tokens: &[Token], token_range: Range<usize>) -> String {
+    let mut text = String::new();
+
+    for token in &tokens[token_range] {
+        match token {
+            Token::Text(value) => text.push_str(value),
+            Token::Atom(AtomKind::InlineCode(value))
+            | Token::Atom(AtomKind::InlineHtml(value))
+            | Token::Atom(AtomKind::Html(value))
+            | Token::Atom(AtomKind::FootnoteReference(value))
+            | Token::Atom(AtomKind::InlineMath(value))
+            | Token::Atom(AtomKind::DisplayMath(value)) => text.push_str(value),
+            Token::Atom(AtomKind::SoftBreak) | Token::Atom(AtomKind::HardBreak) => text.push('\n'),
+            _ => {}
+        }
+    }
+
+    text
+}
+
+fn change_region_for_substitution(
+    substitution: &Substitution,
+    reference_blocks: &[ReferenceBlock],
+) -> ChangeRegion {
+    let block_indices = overlapping_block_indices(&substitution.reference_range, reference_blocks);
+    let block_kinds = block_indices
+        .iter()
+        .filter_map(|index| reference_blocks.get(*index))
+        .map(|block| block.kind.clone())
+        .collect();
+    let primary_anchor = block_indices
+        .first()
+        .and_then(|index| reference_blocks.get(*index))
+        .map(|block| block.anchor.clone());
+
+    ChangeRegion {
+        reference_range: substitution.reference_range.clone(),
+        reference_source_range: substitution.reference_source_range.clone(),
+        alternative_source_range: substitution.alternative_source_range.clone(),
+        block_indices,
+        block_kinds,
+        primary_anchor,
+        weight: change_weight_for_range(&substitution.reference_range, &substitution.replacement),
+        replacement: substitution.replacement.clone(),
+    }
+}
+
+fn unchanged_region_for_range(
+    reference_range: Range<usize>,
+    reference: &NormalizedDocument,
+    reference_blocks: &[ReferenceBlock],
+) -> UnchangedRegion {
+    let block_indices = overlapping_block_indices(&reference_range, reference_blocks);
+    let block_kinds = block_indices
+        .iter()
+        .filter_map(|index| reference_blocks.get(*index))
+        .map(|block| block.kind.clone())
+        .collect();
+    let primary_anchor = block_indices
+        .first()
+        .and_then(|index| reference_blocks.get(*index))
+        .map(|block| block.anchor.clone());
+
+    UnchangedRegion {
+        reference_source_range: source_span_for_token_range(
+            &reference.token_ranges,
+            reference_range.clone(),
+        ),
+        reference_range,
+        block_indices,
+        block_kinds,
+        primary_anchor,
+    }
+}
+
+fn overlapping_block_indices(
+    reference_range: &Range<usize>,
+    reference_blocks: &[ReferenceBlock],
+) -> Vec<usize> {
+    reference_blocks
+        .iter()
+        .filter(|block| ranges_overlap(reference_range, &block.token_range))
+        .map(|block| block.index)
+        .collect()
+}
+
+fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn change_weight_for_range(reference_range: &Range<usize>, replacement: &[Token]) -> ChangeWeight {
+    let size = reference_range.len().max(replacement.len());
+
+    if size <= 3 {
+        ChangeWeight::Small
+    } else if size <= 12 {
+        ChangeWeight::Medium
+    } else {
+        ChangeWeight::Large
+    }
+}
+
+#[allow(clippy::ptr_arg)]
+fn merge_adjacent_changed_regions(changed_regions: &mut Vec<ChangeRegion>, merge_gap: usize) {
+    if changed_regions.is_empty() {
+        return;
+    }
+
+    let mut merged = Vec::with_capacity(changed_regions.len());
+    let mut current = changed_regions[0].clone();
+
+    for next in changed_regions.iter().skip(1) {
+        if next
+            .reference_range
+            .start
+            .saturating_sub(current.reference_range.end)
+            <= merge_gap
+        {
+            current.reference_range.end = next.reference_range.end;
+            current.reference_source_range.end = next.reference_source_range.end;
+            current.alternative_source_range.end = next.alternative_source_range.end;
+            current.replacement.extend(next.replacement.clone());
+            current
+                .block_indices
+                .extend(next.block_indices.iter().copied());
+            current.block_indices.sort_unstable();
+            current.block_indices.dedup();
+            current.block_kinds.extend(next.block_kinds.clone());
+            current.block_kinds.dedup();
+            current.weight =
+                change_weight_for_range(&current.reference_range, &current.replacement);
+            if current.primary_anchor.is_none() {
+                current.primary_anchor = next.primary_anchor.clone();
+            }
+        } else {
+            merged.push(current);
+            current = next.clone();
+        }
+    }
+
+    merged.push(current);
+    *changed_regions = merged;
+}
+
+fn expand_changed_regions_to_blocks(
+    changed_regions: &mut [ChangeRegion],
+    reference: &NormalizedDocument,
+    reference_blocks: &[ReferenceBlock],
+) {
+    for region in changed_regions.iter_mut() {
+        if region.block_indices.is_empty() {
+            continue;
+        }
+
+        let first = region.block_indices[0];
+        let last = *region.block_indices.last().expect("not empty");
+        if let (Some(first_block), Some(last_block)) =
+            (reference_blocks.get(first), reference_blocks.get(last))
+        {
+            region.reference_range = first_block.token_range.start..last_block.token_range.end;
+            region.reference_source_range = source_span_for_token_range(
+                &reference.token_ranges,
+                region.reference_range.clone(),
+            );
+            region.block_kinds = region
+                .block_indices
+                .iter()
+                .filter_map(|index| reference_blocks.get(*index))
+                .map(|block| block.kind.clone())
+                .collect();
+            region.primary_anchor = Some(first_block.anchor.clone());
+            region.weight = change_weight_for_range(&region.reference_range, &region.replacement);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OpenBlock {
+    kind: StructureKind,
+    token_start: usize,
+    anchor: BlockAnchor,
 }
 
 #[derive(Debug, Clone)]
@@ -504,18 +947,60 @@ fn push_event(
             );
             Ok(())
         }
-        Event::InlineMath(_) | Event::DisplayMath(_) => Err(Error::UnsupportedFeature {
-            message: "math events are not supported in v1".to_string(),
-        }),
-        Event::Html(html) | Event::InlineHtml(html) => Err(Error::UnsupportedFeature {
-            message: format!("HTML is not supported in v1: {html:?}"),
-        }),
-        Event::FootnoteReference(label) => Err(Error::UnsupportedFeature {
-            message: format!("footnotes are not supported in v1: {label}"),
-        }),
-        Event::TaskListMarker(_) => Err(Error::UnsupportedFeature {
-            message: "task lists are not supported in v1".to_string(),
-        }),
+        Event::InlineMath(text) => {
+            push_token(
+                tokens,
+                token_ranges,
+                Token::Atom(AtomKind::InlineMath(text.into_string())),
+                source_range,
+            );
+            Ok(())
+        }
+        Event::DisplayMath(text) => {
+            push_token(
+                tokens,
+                token_ranges,
+                Token::Atom(AtomKind::DisplayMath(text.into_string())),
+                source_range,
+            );
+            Ok(())
+        }
+        Event::Html(html) => {
+            push_token(
+                tokens,
+                token_ranges,
+                Token::Atom(AtomKind::Html(html.into_string())),
+                source_range,
+            );
+            Ok(())
+        }
+        Event::InlineHtml(html) => {
+            push_token(
+                tokens,
+                token_ranges,
+                Token::Atom(AtomKind::InlineHtml(html.into_string())),
+                source_range,
+            );
+            Ok(())
+        }
+        Event::FootnoteReference(label) => {
+            push_token(
+                tokens,
+                token_ranges,
+                Token::Atom(AtomKind::FootnoteReference(label.into_string())),
+                source_range,
+            );
+            Ok(())
+        }
+        Event::TaskListMarker(checked) => {
+            push_token(
+                tokens,
+                token_ranges,
+                Token::Atom(AtomKind::TaskListMarker(checked)),
+                source_range,
+            );
+            Ok(())
+        }
     }
 }
 
@@ -545,6 +1030,12 @@ fn push_start_tag(
             tokens,
             token_ranges,
             Token::Start(StructureKind::BlockQuote),
+            source_range,
+        ),
+        Tag::HtmlBlock => push_token(
+            tokens,
+            token_ranges,
+            Token::Start(StructureKind::HtmlBlock),
             source_range,
         ),
         Tag::CodeBlock(kind) => match kind {
@@ -595,10 +1086,56 @@ fn push_start_tag(
             Token::Start(StructureKind::Emphasis),
             source_range,
         ),
+        Tag::Strikethrough => push_token(
+            tokens,
+            token_ranges,
+            Token::Start(StructureKind::Strikethrough),
+            source_range,
+        ),
         Tag::Strong => push_token(
             tokens,
             token_ranges,
             Token::Start(StructureKind::Strong),
+            source_range,
+        ),
+        Tag::FootnoteDefinition(_) => push_token(
+            tokens,
+            token_ranges,
+            Token::Start(StructureKind::FootnoteDefinition),
+            source_range,
+        ),
+        Tag::Table(alignments) => {
+            push_token(
+                tokens,
+                token_ranges,
+                Token::Start(StructureKind::Table),
+                source_range.clone(),
+            );
+            push_token(
+                tokens,
+                token_ranges,
+                Token::Atom(AtomKind::TableAlignment(
+                    alignments.into_iter().map(table_alignment_kind).collect(),
+                )),
+                source_range,
+            );
+        }
+        Tag::TableHead => push_token(
+            tokens,
+            token_ranges,
+            Token::Start(StructureKind::TableHead),
+            source_range,
+        ),
+        Tag::TableRow => push_token(
+            tokens,
+            token_ranges,
+            Token::Start(StructureKind::TableRow),
+            source_range,
+        ),
+        Tag::TableCell => push_token(
+            tokens,
+            token_ranges,
+            Token::Start(StructureKind::TableCell),
             source_range,
         ),
         Tag::Link {
@@ -677,6 +1214,12 @@ fn push_end_tag(
             Token::End(StructureKind::BlockQuote),
             source_range,
         ),
+        TagEnd::HtmlBlock => push_token(
+            tokens,
+            token_ranges,
+            Token::End(StructureKind::HtmlBlock),
+            source_range,
+        ),
         TagEnd::CodeBlock => push_token(
             tokens,
             token_ranges,
@@ -707,10 +1250,46 @@ fn push_end_tag(
             Token::End(StructureKind::Emphasis),
             source_range,
         ),
+        TagEnd::Strikethrough => push_token(
+            tokens,
+            token_ranges,
+            Token::End(StructureKind::Strikethrough),
+            source_range,
+        ),
         TagEnd::Strong => push_token(
             tokens,
             token_ranges,
             Token::End(StructureKind::Strong),
+            source_range,
+        ),
+        TagEnd::FootnoteDefinition => push_token(
+            tokens,
+            token_ranges,
+            Token::End(StructureKind::FootnoteDefinition),
+            source_range,
+        ),
+        TagEnd::Table => push_token(
+            tokens,
+            token_ranges,
+            Token::End(StructureKind::Table),
+            source_range,
+        ),
+        TagEnd::TableHead => push_token(
+            tokens,
+            token_ranges,
+            Token::End(StructureKind::TableHead),
+            source_range,
+        ),
+        TagEnd::TableRow => push_token(
+            tokens,
+            token_ranges,
+            Token::End(StructureKind::TableRow),
+            source_range,
+        ),
+        TagEnd::TableCell => push_token(
+            tokens,
+            token_ranges,
+            Token::End(StructureKind::TableCell),
             source_range,
         ),
         TagEnd::Link => push_token(
@@ -804,6 +1383,15 @@ impl TextChunkKind {
         } else {
             Self::Punctuation
         }
+    }
+}
+
+fn table_alignment_kind(alignment: Alignment) -> TableAlignmentKind {
+    match alignment {
+        Alignment::None => TableAlignmentKind::None,
+        Alignment::Left => TableAlignmentKind::Left,
+        Alignment::Center => TableAlignmentKind::Center,
+        Alignment::Right => TableAlignmentKind::Right,
     }
 }
 
@@ -976,13 +1564,56 @@ mod tests {
     }
 
     #[test]
-    fn rejects_inline_html() {
+    fn degrades_inline_html_to_tokens() {
+        let options = Options::default();
+        let normalized = normalize_document(&Document::new("<span>html</span>"), &options).unwrap();
+
+        assert!(
+            normalized
+                .tokens
+                .contains(&Token::Atom(AtomKind::InlineHtml("<span>".to_string())))
+                || normalized.tokens.contains(&Token::Atom(AtomKind::Html(
+                    "<span>html</span>".to_string()
+                )))
+        );
+    }
+
+    #[test]
+    fn parses_task_lists_footnotes_tables_and_math() {
         let options = Options::default();
 
-        assert!(matches!(
-            normalize_document(&Document::new("<span>html</span>"), &options),
-            Err(Error::UnsupportedFeature { .. })
-        ));
+        let task_list = normalize_document(&Document::new("- [x] done"), &options).unwrap();
+        assert!(
+            task_list
+                .tokens
+                .contains(&Token::Atom(AtomKind::TaskListMarker(true)))
+        );
+
+        let footnote = normalize_document(&Document::new("[^1]\n\n[^1]: note"), &options).unwrap();
+        assert!(
+            footnote
+                .tokens
+                .contains(&Token::Atom(AtomKind::FootnoteReference("1".to_string())))
+        );
+        assert!(
+            footnote
+                .tokens
+                .contains(&Token::Start(StructureKind::FootnoteDefinition))
+        );
+
+        let table = normalize_document(&Document::new("| a |\n| - |\n| b |\n"), &options).unwrap();
+        assert!(table.tokens.contains(&Token::Start(StructureKind::Table)));
+        assert!(
+            table
+                .tokens
+                .contains(&Token::Start(StructureKind::TableRow))
+        );
+
+        let math = normalize_document(&Document::new("Inline $x$ and $$y$$"), &options).unwrap();
+        assert!(math.tokens.iter().any(|token| matches!(
+            token,
+            Token::Atom(AtomKind::InlineMath(_)) | Token::Atom(AtomKind::DisplayMath(_))
+        )));
     }
 
     #[test]
@@ -995,6 +1626,8 @@ mod tests {
 
         assert_eq!(result.comparisons.len(), 1);
         assert!(result.comparisons[0].substitutions.is_empty());
+        assert!(result.comparisons[0].changed_regions.is_empty());
+        assert!(!result.comparisons[0].unchanged_regions.is_empty());
     }
 
     #[test]
@@ -1014,6 +1647,11 @@ mod tests {
                 alternative_source_range: 7..12,
                 replacement: vec![Token::Text("there".to_string())],
             }
+        );
+        assert_eq!(result.comparisons[0].changed_regions.len(), 1);
+        assert_eq!(
+            result.comparisons[0].changed_regions[0].weight,
+            ChangeWeight::Small
         );
     }
 
@@ -1045,9 +1683,22 @@ mod tests {
             ],
             token_ranges: vec![0..1, 1..2, 2..3, 3..4],
         };
+        let reference_blocks = vec![ReferenceBlock {
+            index: 0,
+            kind: BlockKind::Paragraph,
+            token_range: 0..4,
+            source_range: 0..4,
+            anchor: BlockAnchor {
+                block_index: 0,
+                block_path: vec![0],
+                heading_path: vec![],
+                list_item_index: None,
+            },
+            text: "abcd".to_string(),
+        }];
 
         assert_eq!(
-            diff_documents(&reference, &alternative, &options),
+            build_comparison(&reference, &reference_blocks, &alternative, &options).substitutions,
             vec![Substitution {
                 reference_range: 1..4,
                 reference_source_range: 1..4,
@@ -1058,6 +1709,44 @@ mod tests {
                     Token::Text("y".to_string()),
                 ],
             }]
+        );
+    }
+
+    #[test]
+    fn compare_many_builds_reference_blocks_and_id_index() {
+        let options = Options::default();
+        let reference = Document::with_id("reference", "# Title\n\nHello world.\n");
+        let alternatives = vec![
+            Document::with_id("a", "# Title\n\nHello there.\n"),
+            Document::with_id("b", "# Other\n\nHello world.\n"),
+        ];
+        let result = compare_many(&reference, &alternatives, &options).unwrap();
+
+        assert_eq!(result.reference_blocks.len(), 2);
+        assert_eq!(result.reference_blocks[0].kind, BlockKind::Heading);
+        assert_eq!(result.reference_blocks[1].kind, BlockKind::Paragraph);
+        assert!(result.comparison_by_id("a").is_some());
+        assert_eq!(result.comparison_index.get("b"), Some(&1));
+    }
+
+    #[test]
+    fn block_level_changes_can_be_requested() {
+        let options = Options {
+            block_level_changes_only: true,
+            ..Options::default()
+        };
+        let result = compare_pair(
+            &Document::new("First paragraph.\n\nSecond paragraph.\n"),
+            &Document::new("First paragraph.\n\nChanged paragraph.\n"),
+            &options,
+        )
+        .unwrap();
+
+        assert!(result.comparisons[0].substitutions.is_empty());
+        assert_eq!(result.comparisons[0].changed_regions.len(), 1);
+        assert_eq!(
+            result.comparisons[0].changed_regions[0].block_kinds,
+            vec![BlockKind::Paragraph]
         );
     }
 

@@ -72,7 +72,7 @@ The main entry points are:
 
 - `normalize_document`: parse one Markdown document and return its normalized token stream.
 - `compare_pair`: compare one reference document against one alternative.
-- `compare_many`: compare one reference document against zero or more alternatives.
+- `compare_many`: compare one reference document against zero or more alternatives and build a stable alternative-ID index.
 
 Example:
 
@@ -101,6 +101,9 @@ The public API is built around these core types:
 - `Substitution`: one contiguous replacement of part of the reference with part of an alternative.
 - `Comparison`: the full result for one reference and one alternative.
 - `ComparisonSet`: the full result for comparing one reference against all alternatives.
+- `ChangeRegion`: one UI-oriented changed region grouped above raw substitutions.
+- `ReferenceBlock`: one block-level unit in the reference document.
+- `BlockAnchor`: a structural anchor with block path, heading path, and list item index.
 - `SourceSpan`: a byte range plus line and column positions.
 
 For `v1`, tokenization should favor determinism over richness. If a syntax detail is not needed for comparison, it should be normalized away instead of preserved by default.
@@ -134,6 +137,15 @@ In the current `v1` implementation, consolidation is still intentionally simple:
 
 Text diffs are finer than whole parser text events: visible text is split into word, whitespace, and punctuation chunks before diffing. This keeps common edits such as `Hello world.` to `Hello there.` localized to the changed word.
 
+For higher-level integrations, each comparison also exposes:
+
+- `changed_regions`
+- `unchanged_regions`
+- `reference_blocks`
+- stable alternative lookup by ID via `ComparisonSet::comparison_by_id`
+
+If `Options::block_level_changes_only` is enabled, `markalign` emphasizes block-level change regions instead of detailed substitutions.
+
 ## Markdown Support
 
 `v1` deliberately supports a small Markdown subset.
@@ -150,9 +162,10 @@ Text diffs are finer than whole parser text events: visible text is split into w
 | Thematic breaks | Supported | Preserved as an atom token. |
 | Soft and hard breaks | Supported | Preserved as atom tokens. |
 | Inline HTML and block HTML | Rejected | Returns `UnsupportedFeature`. |
-| Footnotes | Not enabled | Parsed as ordinary Markdown text with the current parser options. |
-| Math | Not enabled | Parsed as ordinary Markdown text with the current parser options. |
-| Task lists | Not enabled | Parsed as ordinary Markdown list text with the current parser options. |
+| Footnotes | Supported | Parsed into footnote reference and definition structures. |
+| Math | Supported | Parsed into opaque inline and display math tokens. |
+| Task lists | Supported | Parsed into task marker tokens inside list items. |
+| HTML | Degraded | Preserved as opaque HTML tokens instead of causing comparison failure. |
 
 ## Output
 
@@ -182,7 +195,7 @@ The result should also be serializable.
 
 - Only Markdown is supported.
 - Only `pulldown-cmark` is supported as parser backend.
-- Several Markdown-adjacent features are rejected instead of normalized.
+- Some rich Markdown constructs are still compared conservatively through opaque tokens instead of deeper semantic normalization.
 - Diff consolidation is intentionally simple and may not always match human editing intent.
 - The JSON shape is tested, but long-term serialization stability is not guaranteed yet.
 - There is no CLI, renderer, or HTML output layer.
