@@ -368,6 +368,8 @@ pub struct ComparisonSet {
     pub reference_blocks: Vec<ReferenceBlock>,
     pub comparisons: Vec<Comparison>,
     pub comparison_index: BTreeMap<String, usize>,
+    pub shared_unchanged_regions: Vec<UnchangedRegion>,
+    pub variant_clusters: Vec<VariantCluster>,
 }
 
 /// Errors that future parsing, normalization, and comparison steps may report.
@@ -383,6 +385,28 @@ pub enum Error {
     UnsupportedFeature {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct VariantCluster {
+    pub reference_range: Range<usize>,
+    pub reference_source_range: Range<usize>,
+    pub block_indices: Vec<usize>,
+    pub block_kinds: Vec<BlockKind>,
+    pub primary_anchor: Option<BlockAnchor>,
+    pub variants: Vec<RegionVariant>,
+    pub unchanged_alternatives: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RegionVariant {
+    pub alternative_id: String,
+    pub alternative_index: usize,
+    pub alternative_source_range: Range<usize>,
+    pub weight: ChangeWeight,
+    pub replacement: Vec<Token>,
 }
 
 pub fn normalize_document(
@@ -447,11 +471,16 @@ pub fn compare_many(
         comparisons.push(comparison);
     }
 
+    let shared_unchanged_regions = build_shared_unchanged_regions(&comparisons);
+    let variant_clusters = build_variant_clusters(&comparisons);
+
     Ok(ComparisonSet {
         reference,
         reference_blocks,
         comparisons,
         comparison_index,
+        shared_unchanged_regions,
+        variant_clusters,
     })
 }
 
@@ -1118,6 +1147,101 @@ fn expand_changed_regions_to_blocks(
             region.primary_anchor = Some(first_block.anchor.clone());
             region.weight = change_weight_for_range(&region.reference_range, &region.replacement);
         }
+    }
+}
+
+fn build_shared_unchanged_regions(comparisons: &[Comparison]) -> Vec<UnchangedRegion> {
+    let Some(first) = comparisons.first() else {
+        return Vec::new();
+    };
+
+    let mut shared = first.unchanged_regions.clone();
+
+    for comparison in comparisons.iter().skip(1) {
+        shared.retain(|candidate| {
+            comparison.unchanged_regions.iter().any(|region| {
+                region.reference_range == candidate.reference_range
+                    && region.primary_anchor == candidate.primary_anchor
+            })
+        });
+    }
+
+    shared
+}
+
+fn build_variant_clusters(comparisons: &[Comparison]) -> Vec<VariantCluster> {
+    let mut grouped: BTreeMap<VariantClusterKey, Vec<(usize, &Comparison, &ChangeRegion)>> =
+        BTreeMap::new();
+
+    for (alternative_index, comparison) in comparisons.iter().enumerate() {
+        for region in &comparison.changed_regions {
+            grouped
+                .entry(variant_cluster_key(region))
+                .or_default()
+                .push((alternative_index, comparison, region));
+        }
+    }
+
+    grouped
+        .into_values()
+        .map(|entries| {
+            let (_, _, first_region) = &entries[0];
+            let mut seen = vec![false; comparisons.len()];
+            let variants = entries
+                .iter()
+                .map(|(alternative_index, comparison, region)| {
+                    seen[*alternative_index] = true;
+                    RegionVariant {
+                        alternative_id: stable_alternative_id(comparison, *alternative_index),
+                        alternative_index: *alternative_index,
+                        alternative_source_range: region.alternative_source_range.clone(),
+                        weight: region.weight,
+                        replacement: region.replacement.clone(),
+                    }
+                })
+                .collect();
+            let unchanged_alternatives = comparisons
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !seen[*index])
+                .map(|(index, comparison)| stable_alternative_id(comparison, index))
+                .collect();
+
+            VariantCluster {
+                reference_range: first_region.reference_range.clone(),
+                reference_source_range: first_region.reference_source_range.clone(),
+                block_indices: first_region.block_indices.clone(),
+                block_kinds: first_region.block_kinds.clone(),
+                primary_anchor: first_region.primary_anchor.clone(),
+                variants,
+                unchanged_alternatives,
+            }
+        })
+        .collect()
+}
+
+fn stable_alternative_id(comparison: &Comparison, alternative_index: usize) -> String {
+    comparison
+        .alternative_id
+        .clone()
+        .unwrap_or_else(|| format!("alternative-{alternative_index}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct VariantClusterKey {
+    reference_start: usize,
+    reference_end: usize,
+    anchor_key: Option<String>,
+}
+
+fn variant_cluster_key(region: &ChangeRegion) -> VariantClusterKey {
+    VariantClusterKey {
+        reference_start: region.reference_range.start,
+        reference_end: region.reference_range.end,
+        anchor_key: region
+            .primary_anchor
+            .as_ref()
+            .map(|anchor| anchor.block_key.clone()),
     }
 }
 
@@ -2031,6 +2155,46 @@ mod tests {
         assert_eq!(result.reference_blocks[1].kind, BlockKind::Paragraph);
         assert!(result.comparison_by_id("a").is_some());
         assert_eq!(result.comparison_index.get("b"), Some(&1));
+        assert!(result.shared_unchanged_regions.is_empty());
+        assert_eq!(result.variant_clusters.len(), 2);
+    }
+
+    #[test]
+    fn compare_many_builds_variant_clusters() {
+        let options = Options::default();
+        let reference = Document::with_id("reference", "# Title\n\nHello world.\n");
+        let alternatives = vec![
+            Document::with_id("a", "# Title\n\nHello there.\n"),
+            Document::with_id("b", "# Other\n\nHello world.\n"),
+            Document::with_id("c", "# Title\n\nHello world.\n"),
+        ];
+        let result = compare_many(&reference, &alternatives, &options).unwrap();
+
+        assert_eq!(result.variant_clusters.len(), 2);
+        let mut variant_ids = result
+            .variant_clusters
+            .iter()
+            .flat_map(|cluster| {
+                cluster
+                    .variants
+                    .iter()
+                    .map(|variant| variant.alternative_id.clone())
+            })
+            .collect::<Vec<_>>();
+        variant_ids.sort();
+        assert_eq!(variant_ids, vec!["a".to_string(), "b".to_string()]);
+        assert!(
+            result
+                .variant_clusters
+                .iter()
+                .all(|cluster| cluster.variants.len() == 1)
+        );
+        assert!(
+            result
+                .variant_clusters
+                .iter()
+                .all(|cluster| cluster.unchanged_alternatives.contains(&"c".to_string()))
+        );
     }
 
     #[test]

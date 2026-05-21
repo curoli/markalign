@@ -104,6 +104,7 @@ The public API is built around these core types:
 - `ChangeRegion`: one UI-oriented changed region grouped above raw substitutions.
 - `ReferenceBlock`: one block-level unit in the reference document.
 - `BlockAnchor`: a structural anchor with positional and stable block and heading paths, plus list item index.
+- `VariantCluster`: a multi-alternative cluster of competing variants for the same reference region.
 - `SourceSpan`: a byte range plus line and column positions.
 
 For `v1`, tokenization should favor determinism over richness. If a syntax detail is not needed for comparison, it should be normalized away instead of preserved by default.
@@ -147,6 +148,11 @@ For higher-level integrations, each comparison also exposes:
 If `Options::block_level_changes_only` is enabled, `markalign` emphasizes block-level change regions instead of detailed substitutions.
 
 Block regions are now aligned in two phases: first by structural block identity, then by block content. That lets `markalign` treat small inline edits inside the same paragraph or heading differently from full block replacement.
+
+For multi-alternative workflows, `ComparisonSet` also exposes:
+
+- `shared_unchanged_regions`
+- `variant_clusters`
 
 ## Markdown Support
 
