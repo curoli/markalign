@@ -252,6 +252,10 @@ pub struct BlockAnchor {
     pub block_index: usize,
     pub block_path: Vec<usize>,
     pub heading_path: Vec<usize>,
+    pub stable_block_path: Vec<String>,
+    pub stable_heading_path: Vec<String>,
+    pub block_key: String,
+    pub sibling_index: usize,
     pub list_item_index: Option<usize>,
 }
 
@@ -583,6 +587,10 @@ fn build_blocks(document: &NormalizedDocument) -> Vec<ReferenceBlock> {
                         .chain(core::iter::once(block_index))
                         .collect(),
                     heading_path: effective_heading_path,
+                    stable_block_path: Vec::new(),
+                    stable_heading_path: Vec::new(),
+                    block_key: String::new(),
+                    sibling_index: 0,
                     list_item_index,
                 };
 
@@ -622,20 +630,21 @@ fn build_blocks(document: &NormalizedDocument) -> Vec<ReferenceBlock> {
         }
     }
 
+    enrich_block_anchors(document, &mut blocks);
     blocks
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct BlockMatchKey {
     kind: BlockKind,
-    heading_path: Vec<usize>,
+    heading_path: Vec<String>,
     list_item_index: Option<usize>,
 }
 
 fn block_match_key(block: &ReferenceBlock) -> BlockMatchKey {
     BlockMatchKey {
         kind: block.kind.clone(),
-        heading_path: block.anchor.heading_path.clone(),
+        heading_path: block.anchor.stable_heading_path.clone(),
         list_item_index: block.anchor.list_item_index,
     }
 }
@@ -651,6 +660,106 @@ fn block_kind_for_structure(kind: StructureKind) -> Option<BlockKind> {
         StructureKind::HtmlBlock => Some(BlockKind::HtmlBlock),
         StructureKind::FootnoteDefinition => Some(BlockKind::FootnoteDefinition),
         _ => None,
+    }
+}
+
+fn enrich_block_anchors(document: &NormalizedDocument, blocks: &mut [ReferenceBlock]) {
+    let mut sibling_counters: BTreeMap<(Vec<usize>, BlockKind), usize> = BTreeMap::new();
+    let mut stable_heading_path: Vec<String> = Vec::new();
+
+    for index in 0..blocks.len() {
+        let parent_path = blocks[index]
+            .anchor
+            .block_path
+            .iter()
+            .copied()
+            .take(blocks[index].anchor.block_path.len().saturating_sub(1))
+            .collect::<Vec<_>>();
+        let counter_key = (parent_path, blocks[index].kind.clone());
+        let sibling_index = sibling_counters
+            .entry(counter_key)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        let text_key = anchor_text_key(&blocks[index].text);
+        let block_key = format!(
+            "{}:{}:{}",
+            block_kind_tag(&blocks[index].kind),
+            sibling_index,
+            text_key
+        );
+        let stable_block_path = blocks[index]
+            .anchor
+            .block_path
+            .iter()
+            .copied()
+            .take(blocks[index].anchor.block_path.len().saturating_sub(1))
+            .filter_map(|block_index| blocks.get(block_index))
+            .map(|block| block.anchor.block_key.clone())
+            .chain(core::iter::once(block_key.clone()))
+            .collect::<Vec<_>>();
+
+        let stable_heading_path_for_block =
+            if let Some(level) = heading_level_for_block(document, &blocks[index]) {
+                stable_heading_path.truncate(level.saturating_sub(1) as usize);
+                stable_heading_path.push(block_key.clone());
+                stable_heading_path.clone()
+            } else {
+                stable_heading_path.clone()
+            };
+
+        blocks[index].anchor.sibling_index = *sibling_index;
+        blocks[index].anchor.block_key = block_key;
+        blocks[index].anchor.stable_block_path = stable_block_path;
+        blocks[index].anchor.stable_heading_path = stable_heading_path_for_block;
+    }
+}
+
+fn heading_level_for_block(document: &NormalizedDocument, block: &ReferenceBlock) -> Option<u8> {
+    match document.tokens.get(block.token_range.start) {
+        Some(Token::Start(StructureKind::Heading { level })) => Some(*level),
+        _ => None,
+    }
+}
+
+fn block_kind_tag(kind: &BlockKind) -> &'static str {
+    match kind {
+        BlockKind::Paragraph => "paragraph",
+        BlockKind::Heading => "heading",
+        BlockKind::BlockQuote => "blockquote",
+        BlockKind::ListItem => "list-item",
+        BlockKind::CodeBlock => "code-block",
+        BlockKind::TableRow => "table-row",
+        BlockKind::HtmlBlock => "html-block",
+        BlockKind::FootnoteDefinition => "footnote-definition",
+    }
+}
+
+fn anchor_text_key(text: &str) -> String {
+    let mut key = String::new();
+    let mut previous_was_separator = false;
+
+    for ch in text.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            key.push(ch);
+            previous_was_separator = false;
+        } else if !previous_was_separator && !key.is_empty() {
+            key.push('-');
+            previous_was_separator = true;
+        }
+
+        if key.len() >= 32 {
+            break;
+        }
+    }
+
+    while key.ends_with('-') {
+        key.pop();
+    }
+
+    if key.is_empty() {
+        "empty".to_string()
+    } else {
+        key
     }
 }
 
@@ -1883,6 +1992,10 @@ mod tests {
                 block_index: 0,
                 block_path: vec![0],
                 heading_path: vec![],
+                stable_block_path: vec!["paragraph:1:abcd".to_string()],
+                stable_heading_path: vec![],
+                block_key: "paragraph:1:abcd".to_string(),
+                sibling_index: 1,
                 list_item_index: None,
             },
             text: "abcd".to_string(),
@@ -1918,6 +2031,29 @@ mod tests {
         assert_eq!(result.reference_blocks[1].kind, BlockKind::Paragraph);
         assert!(result.comparison_by_id("a").is_some());
         assert_eq!(result.comparison_index.get("b"), Some(&1));
+    }
+
+    #[test]
+    fn builds_stable_block_and_heading_paths() {
+        let options = Options::default();
+        let document = Document::new("# Title\n\n- first\n- second\n");
+        let normalized = normalize_document(&document, &options).unwrap();
+        let blocks = build_blocks(&normalized);
+
+        assert_eq!(blocks[0].anchor.block_key, "heading:1:title");
+        assert_eq!(
+            blocks[0].anchor.stable_heading_path,
+            vec!["heading:1:title".to_string()]
+        );
+        assert_eq!(
+            blocks[1].anchor.stable_block_path,
+            vec!["list-item:1:first".to_string()]
+        );
+        assert_eq!(
+            blocks[1].anchor.stable_heading_path,
+            vec!["heading:1:title".to_string()]
+        );
+        assert_eq!(blocks[2].anchor.sibling_index, 2);
     }
 
     #[test]

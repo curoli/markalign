@@ -103,7 +103,7 @@ The public API is built around these core types:
 - `ComparisonSet`: the full result for comparing one reference against all alternatives.
 - `ChangeRegion`: one UI-oriented changed region grouped above raw substitutions.
 - `ReferenceBlock`: one block-level unit in the reference document.
-- `BlockAnchor`: a structural anchor with block path, heading path, and list item index.
+- `BlockAnchor`: a structural anchor with positional and stable block and heading paths, plus list item index.
 - `SourceSpan`: a byte range plus line and column positions.
 
 For `v1`, tokenization should favor determinism over richness. If a syntax detail is not needed for comparison, it should be normalized away instead of preserved by default.
