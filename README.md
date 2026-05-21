@@ -16,12 +16,18 @@ A parser will parse the source document and `markalign` will use the result to c
 
 Then, each alternative token stream will be compared to the reference token stream using the [similar crate](https://crates.io/crates/similar) to get a diff stream of tokens that are equal, tokes that are removed and tokens that are added.
 
-Then, the diff stream is consolidated. Consecutive remove and add tokens are consolidated into a single substitution. Consecutive character tokens are consolidated into a single string token. Consolidation can also remove spurious equalities, that is, small pieces of text that happen to occurr in both the reference and one of the alternatives, but are probably insignificant, will be merged into substitutions.
+Then, the diff stream is consolidated. Consecutive remove and add tokens are consolidated into a single substitution. Consecutive character tokens are consolidated into a single string token.
+
+Consolidation can also remove spurious equalities, that is, small pieces of text that happen to occurr in both the reference and one of the alternatives, but are probably insignificant, will be merged into substitutions.
+
+Consolidation can also be used to remove undesired Markup features.
 
 In the end, we have a stream of tokens representing the compiled reference, which can easily be converted to, for example, HTML. 
 
 It also contains tokens that mark the begining and end of each piece of the reference that would need to be replaced to turn the reference into one of the alternatives. IN other words, each alternative is represented as a list of substitions that would need to be applied to the reference. For example:
 
  * If an alternative is identical to the reference, the list of substitutions is empty.
- * If an alternative is completely different from the reference, it will be one substitution, whcih consist of replacing the entire reference with the entire alternative.
+ * If an alternative is completely different from the reference, it will be one substitution, which consists of replacing the entire reference with the entire alternative.
  * If the alternative is essentially the reference with some minor edits, then it is a list of substitutions reflecting these edits
+
+`markalign` will also support serialization of the result.
