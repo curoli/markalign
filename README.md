@@ -154,6 +154,8 @@ For multi-alternative workflows, `ComparisonSet` also exposes:
 - `shared_unchanged_regions`
 - `variant_clusters`
 
+These multi-alternative results are now built from a shared block-level alignment pass across the reference and all alternatives. They are no longer just a post-processing layer over already-finished pairwise regions, which makes shared unchanged regions and competing variants more coherent for server-side and UI integration.
+
 ## Markdown Support
 
 `v1` deliberately supports a small Markdown subset.

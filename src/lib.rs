@@ -458,21 +458,24 @@ pub fn compare_many(
     let reference = normalize_document(reference, options)?;
     let reference_blocks = build_reference_blocks(&reference);
     let mut comparisons = Vec::with_capacity(alternatives.len());
+    let mut alignments = Vec::with_capacity(alternatives.len());
     let mut comparison_index = BTreeMap::new();
 
     for (index, alternative) in alternatives.iter().enumerate() {
         let normalized = normalize_document(alternative, options)?;
-        let comparison = build_comparison(&reference, &reference_blocks, &normalized, options);
+        let (comparison, alignment) =
+            build_comparison(&reference, &reference_blocks, &normalized, options);
 
         if let Some(alternative_id) = &comparison.alternative_id {
             comparison_index.insert(alternative_id.clone(), index);
         }
 
         comparisons.push(comparison);
+        alignments.push(alignment);
     }
 
-    let shared_unchanged_regions = build_shared_unchanged_regions(&comparisons);
-    let variant_clusters = build_variant_clusters(&comparisons);
+    let (shared_unchanged_regions, variant_clusters) =
+        build_joint_multi_summary(&reference, &reference_blocks, &comparisons, &alignments);
 
     Ok(ComparisonSet {
         reference,
@@ -489,7 +492,7 @@ fn build_comparison(
     reference_blocks: &[ReferenceBlock],
     alternative: &NormalizedDocument,
     options: &Options,
-) -> Comparison {
+) -> (Comparison, BlockAlignment) {
     let alternative_blocks = build_blocks(alternative);
     let ops = capture_diff_slices(Algorithm::Myers, &reference.tokens, &alternative.tokens);
     let mut substitutions = Vec::new();
@@ -531,12 +534,14 @@ fn build_comparison(
         substitutions.push(pending.finish(reference, alternative));
     }
 
-    let (mut changed_regions, unchanged_regions) = build_block_regions(
+    let block_alignment = build_block_alignment(
         reference,
         reference_blocks,
         alternative,
         &alternative_blocks,
     );
+    let (mut changed_regions, unchanged_regions) =
+        block_regions_from_alignment(reference, reference_blocks, &block_alignment);
 
     merge_adjacent_changed_regions(&mut changed_regions, options.merge_adjacent_regions_up_to);
 
@@ -545,13 +550,16 @@ fn build_comparison(
         substitutions.clear();
     }
 
-    Comparison {
-        alternative_id: alternative.document_id.clone(),
-        alternative_blocks,
-        substitutions,
-        changed_regions,
-        unchanged_regions,
-    }
+    (
+        Comparison {
+            alternative_id: alternative.document_id.clone(),
+            alternative_blocks,
+            substitutions,
+            changed_regions,
+            unchanged_regions,
+        },
+        block_alignment,
+    )
 }
 
 fn has_following_change(ops: &[similar::DiffOp]) -> bool {
@@ -812,12 +820,12 @@ fn visible_text_for_range(tokens: &[Token], token_range: Range<usize>) -> String
     text
 }
 
-fn build_block_regions(
+fn build_block_alignment(
     reference: &NormalizedDocument,
     reference_blocks: &[ReferenceBlock],
     alternative: &NormalizedDocument,
     alternative_blocks: &[ReferenceBlock],
-) -> (Vec<ChangeRegion>, Vec<UnchangedRegion>) {
+) -> BlockAlignment {
     let reference_signatures: Vec<_> = reference_blocks.iter().map(block_match_key).collect();
     let alternative_signatures: Vec<_> = alternative_blocks.iter().map(block_match_key).collect();
     let ops = capture_diff_slices(
@@ -825,8 +833,7 @@ fn build_block_regions(
         &reference_signatures,
         &alternative_signatures,
     );
-    let mut changed_regions = Vec::new();
-    let mut unchanged_regions = Vec::new();
+    let mut segments = Vec::new();
 
     for op in ops {
         match op.tag() {
@@ -844,15 +851,13 @@ fn build_block_regions(
                         alternative,
                         &alternative_blocks[alternative_index],
                     ) {
-                        if let Some(region) = unchanged_region_for_block_range(
-                            reference_index..(reference_index + 1),
-                            reference,
-                            reference_blocks,
-                        ) {
-                            unchanged_regions.push(region);
-                        }
+                        segments.push(BlockAlignmentSegment {
+                            reference_block_range: reference_index..(reference_index + 1),
+                            _alternative_block_range: alternative_index..(alternative_index + 1),
+                            kind: BlockAlignmentKind::Unchanged,
+                        });
                     } else {
-                        changed_regions.push(change_region_for_matched_blocks(
+                        segments.push(block_alignment_segment_for_block_ranges(
                             reference_index,
                             alternative_index,
                             reference,
@@ -864,19 +869,52 @@ fn build_block_regions(
                 }
             }
             DiffTag::Delete | DiffTag::Insert | DiffTag::Replace => {
-                changed_regions.push(change_region_for_block_ranges(
-                    op.old_range(),
-                    op.new_range(),
-                    reference,
-                    reference_blocks,
-                    alternative,
-                    alternative_blocks,
-                ));
+                let old_range = op.old_range();
+                let new_range = op.new_range();
+
+                if old_range.len() == new_range.len() && !old_range.is_empty() {
+                    for offset in 0..old_range.len() {
+                        let reference_index = old_range.start + offset;
+                        let alternative_index = new_range.start + offset;
+
+                        if blocks_equivalent_for_alignment(
+                            reference,
+                            &reference_blocks[reference_index],
+                            alternative,
+                            &alternative_blocks[alternative_index],
+                        ) {
+                            segments.push(BlockAlignmentSegment {
+                                reference_block_range: reference_index..(reference_index + 1),
+                                _alternative_block_range: alternative_index
+                                    ..(alternative_index + 1),
+                                kind: BlockAlignmentKind::Unchanged,
+                            });
+                        } else {
+                            segments.push(block_alignment_segment_for_block_ranges(
+                                reference_index,
+                                alternative_index,
+                                reference,
+                                reference_blocks,
+                                alternative,
+                                alternative_blocks,
+                            ));
+                        }
+                    }
+                } else {
+                    segments.push(block_alignment_segment_for_ranges(
+                        old_range,
+                        new_range,
+                        reference,
+                        reference_blocks,
+                        alternative,
+                        alternative_blocks,
+                    ));
+                }
             }
         }
     }
 
-    (changed_regions, unchanged_regions)
+    BlockAlignment { segments }
 }
 
 fn block_content_equal(
@@ -889,15 +927,25 @@ fn block_content_equal(
         == alternative.tokens[alternative_block.token_range.clone()]
 }
 
-fn change_region_for_matched_blocks(
+fn blocks_equivalent_for_alignment(
+    reference: &NormalizedDocument,
+    reference_block: &ReferenceBlock,
+    alternative: &NormalizedDocument,
+    alternative_block: &ReferenceBlock,
+) -> bool {
+    reference_block.kind == alternative_block.kind
+        && block_content_equal(reference, reference_block, alternative, alternative_block)
+}
+
+fn block_alignment_segment_for_block_ranges(
     reference_index: usize,
     alternative_index: usize,
     reference: &NormalizedDocument,
     reference_blocks: &[ReferenceBlock],
     alternative: &NormalizedDocument,
     alternative_blocks: &[ReferenceBlock],
-) -> ChangeRegion {
-    change_region_for_block_ranges(
+) -> BlockAlignmentSegment {
+    block_alignment_segment_for_ranges(
         reference_index..(reference_index + 1),
         alternative_index..(alternative_index + 1),
         reference,
@@ -907,54 +955,116 @@ fn change_region_for_matched_blocks(
     )
 }
 
-fn change_region_for_block_ranges(
+fn block_alignment_segment_for_ranges(
     reference_block_range: Range<usize>,
     alternative_block_range: Range<usize>,
     reference: &NormalizedDocument,
     reference_blocks: &[ReferenceBlock],
     alternative: &NormalizedDocument,
     alternative_blocks: &[ReferenceBlock],
-) -> ChangeRegion {
-    let reference_range =
-        token_range_for_blocks(reference_blocks, reference_block_range.clone()).unwrap_or(0..0);
+) -> BlockAlignmentSegment {
     let alternative_range =
         token_range_for_blocks(alternative_blocks, alternative_block_range.clone()).unwrap_or(0..0);
-    let block_indices: Vec<_> = reference_block_range.clone().collect();
-    let block_kinds = block_indices
-        .iter()
-        .filter_map(|index| reference_blocks.get(*index))
-        .map(|block| block.kind.clone())
-        .collect();
-    let primary_anchor = reference_block_range
-        .start
-        .checked_sub(0)
-        .and_then(|index| reference_blocks.get(index))
-        .map(|block| block.anchor.clone());
     let replacement = if alternative_range.is_empty() {
         Vec::new()
     } else {
         alternative.tokens[alternative_range.clone()].to_vec()
     };
 
+    BlockAlignmentSegment {
+        reference_block_range: reference_block_range.clone(),
+        _alternative_block_range: alternative_block_range.clone(),
+        kind: BlockAlignmentKind::Changed {
+            reference_source_range: source_span_for_token_range(
+                &reference.token_ranges,
+                token_range_for_blocks(reference_blocks, reference_block_range.clone())
+                    .unwrap_or(0..0),
+            ),
+            alternative_source_range: source_span_for_token_range(
+                &alternative.token_ranges,
+                alternative_range.clone(),
+            ),
+            weight: change_weight_for_block_ranges(
+                &reference_block_range,
+                &alternative_block_range,
+                reference_blocks,
+                alternative_blocks,
+            ),
+            replacement,
+        },
+    }
+}
+
+fn block_regions_from_alignment(
+    reference: &NormalizedDocument,
+    reference_blocks: &[ReferenceBlock],
+    alignment: &BlockAlignment,
+) -> (Vec<ChangeRegion>, Vec<UnchangedRegion>) {
+    let mut changed_regions = Vec::new();
+    let mut unchanged_regions = Vec::new();
+
+    for segment in &alignment.segments {
+        match &segment.kind {
+            BlockAlignmentKind::Unchanged => {
+                if let Some(region) = unchanged_region_for_block_range(
+                    segment.reference_block_range.clone(),
+                    reference,
+                    reference_blocks,
+                ) {
+                    unchanged_regions.push(region);
+                }
+            }
+            BlockAlignmentKind::Changed {
+                reference_source_range,
+                alternative_source_range,
+                weight,
+                replacement,
+            } => {
+                changed_regions.push(change_region_from_alignment_segment(
+                    segment,
+                    reference_blocks,
+                    reference_source_range.clone(),
+                    alternative_source_range.clone(),
+                    *weight,
+                    replacement.clone(),
+                ));
+            }
+        }
+    }
+
+    (changed_regions, unchanged_regions)
+}
+
+fn change_region_from_alignment_segment(
+    segment: &BlockAlignmentSegment,
+    reference_blocks: &[ReferenceBlock],
+    reference_source_range: Range<usize>,
+    alternative_source_range: Range<usize>,
+    weight: ChangeWeight,
+    replacement: Vec<Token>,
+) -> ChangeRegion {
+    let reference_range =
+        token_range_for_blocks(reference_blocks, segment.reference_block_range.clone())
+            .unwrap_or(0..0);
+    let block_indices: Vec<_> = segment.reference_block_range.clone().collect();
+    let block_kinds = block_indices
+        .iter()
+        .filter_map(|index| reference_blocks.get(*index))
+        .map(|block| block.kind.clone())
+        .collect();
+    let primary_anchor = block_indices
+        .first()
+        .and_then(|index| reference_blocks.get(*index))
+        .map(|block| block.anchor.clone());
+
     ChangeRegion {
-        reference_source_range: source_span_for_token_range(
-            &reference.token_ranges,
-            reference_range.clone(),
-        ),
-        alternative_source_range: source_span_for_token_range(
-            &alternative.token_ranges,
-            alternative_range.clone(),
-        ),
-        weight: change_weight_for_block_ranges(
-            &reference_block_range,
-            &alternative_block_range,
-            reference_blocks,
-            alternative_blocks,
-        ),
         reference_range,
+        reference_source_range,
+        alternative_source_range,
         block_indices,
         block_kinds,
         primary_anchor,
+        weight,
         replacement,
     }
 }
@@ -1150,69 +1260,314 @@ fn expand_changed_regions_to_blocks(
     }
 }
 
-fn build_shared_unchanged_regions(comparisons: &[Comparison]) -> Vec<UnchangedRegion> {
-    let Some(first) = comparisons.first() else {
-        return Vec::new();
-    };
-
-    let mut shared = first.unchanged_regions.clone();
-
-    for comparison in comparisons.iter().skip(1) {
-        shared.retain(|candidate| {
-            comparison.unchanged_regions.iter().any(|region| {
-                region.reference_range == candidate.reference_range
-                    && region.primary_anchor == candidate.primary_anchor
-            })
-        });
+fn build_joint_multi_summary(
+    reference: &NormalizedDocument,
+    reference_blocks: &[ReferenceBlock],
+    comparisons: &[Comparison],
+    alignments: &[BlockAlignment],
+) -> (Vec<UnchangedRegion>, Vec<VariantCluster>) {
+    if comparisons.is_empty() {
+        return (Vec::new(), Vec::new());
     }
 
-    shared
+    let per_alternative_slots = alignments
+        .iter()
+        .map(|alignment| block_slots_for_alignment(reference_blocks.len(), alignment))
+        .collect::<Vec<_>>();
+    let mut shared_unchanged_regions = Vec::new();
+    let mut variant_clusters = Vec::new();
+    let mut start = 0;
+
+    while start < reference_blocks.len() {
+        let mut end = start + 1;
+        while end < reference_blocks.len()
+            && same_joint_signature(start, end, &per_alternative_slots)
+        {
+            end += 1;
+        }
+
+        if per_alternative_slots
+            .iter()
+            .all(|slots| matches!(slots[start].kind, JointBlockSlotKind::Unchanged))
+        {
+            if let Some(region) =
+                unchanged_region_for_block_range(start..end, reference, reference_blocks)
+            {
+                shared_unchanged_regions.push(region);
+            }
+        } else {
+            variant_clusters.push(variant_cluster_for_joint_region(
+                start..end,
+                reference,
+                reference_blocks,
+                comparisons,
+                alignments,
+                &per_alternative_slots,
+            ));
+        }
+
+        start = end;
+    }
+
+    variant_clusters.extend(build_insertion_variant_clusters(
+        reference,
+        reference_blocks,
+        comparisons,
+        alignments,
+    ));
+
+    (shared_unchanged_regions, variant_clusters)
 }
 
-fn build_variant_clusters(comparisons: &[Comparison]) -> Vec<VariantCluster> {
-    let mut grouped: BTreeMap<VariantClusterKey, Vec<(usize, &Comparison, &ChangeRegion)>> =
-        BTreeMap::new();
+fn block_slots_for_alignment(
+    reference_block_count: usize,
+    alignment: &BlockAlignment,
+) -> Vec<JointBlockSlot> {
+    let mut slots = vec![
+        JointBlockSlot {
+            kind: JointBlockSlotKind::Unchanged,
+        };
+        reference_block_count
+    ];
+
+    for segment in alignment
+        .segments
+        .iter()
+        .filter(|segment| !segment.reference_block_range.is_empty())
+    {
+        let kind = match segment.kind {
+            BlockAlignmentKind::Unchanged => JointBlockSlotKind::Unchanged,
+            BlockAlignmentKind::Changed { .. } => JointBlockSlotKind::Changed,
+        };
+
+        for slot in &mut slots[segment.reference_block_range.clone()] {
+            *slot = JointBlockSlot { kind };
+        }
+    }
+
+    slots
+}
+
+fn same_joint_signature(
+    left_index: usize,
+    right_index: usize,
+    per_alternative_slots: &[Vec<JointBlockSlot>],
+) -> bool {
+    per_alternative_slots
+        .iter()
+        .all(|slots| slots[left_index].kind == slots[right_index].kind)
+}
+
+fn variant_cluster_for_joint_region(
+    reference_block_range: Range<usize>,
+    reference: &NormalizedDocument,
+    reference_blocks: &[ReferenceBlock],
+    comparisons: &[Comparison],
+    alignments: &[BlockAlignment],
+    per_alternative_slots: &[Vec<JointBlockSlot>],
+) -> VariantCluster {
+    let reference_range =
+        token_range_for_blocks(reference_blocks, reference_block_range.clone()).unwrap_or(0..0);
+    let reference_source_range =
+        source_span_for_token_range(&reference.token_ranges, reference_range.clone());
+    let block_indices: Vec<_> = reference_block_range.clone().collect();
+    let block_kinds = block_indices
+        .iter()
+        .filter_map(|index| reference_blocks.get(*index))
+        .map(|block| block.kind.clone())
+        .collect::<Vec<_>>();
+    let primary_anchor = block_indices
+        .first()
+        .and_then(|index| reference_blocks.get(*index))
+        .map(|block| block.anchor.clone());
+    let mut variants = Vec::new();
+    let mut unchanged_alternatives = Vec::new();
 
     for (alternative_index, comparison) in comparisons.iter().enumerate() {
-        for region in &comparison.changed_regions {
+        let slot = per_alternative_slots[alternative_index][reference_block_range.start];
+
+        match slot.kind {
+            JointBlockSlotKind::Unchanged => {
+                unchanged_alternatives.push(stable_alternative_id(comparison, alternative_index));
+            }
+            JointBlockSlotKind::Changed => {
+                let segments = alignments[alternative_index]
+                    .segments
+                    .iter()
+                    .filter(|segment| {
+                        !segment.reference_block_range.is_empty()
+                            && segment.reference_block_range.end > reference_block_range.start
+                            && segment.reference_block_range.start < reference_block_range.end
+                            && matches!(segment.kind, BlockAlignmentKind::Changed { .. })
+                    })
+                    .collect::<Vec<_>>();
+                let alternative_source_range = combined_alternative_source_range(&segments);
+                let replacement = combined_replacement(&segments);
+                let weight = combined_change_weight(
+                    reference_block_range.len(),
+                    replacement.len(),
+                    &segments,
+                );
+
+                variants.push(RegionVariant {
+                    alternative_id: stable_alternative_id(comparison, alternative_index),
+                    alternative_index,
+                    alternative_source_range,
+                    weight,
+                    replacement,
+                });
+            }
+        }
+    }
+
+    VariantCluster {
+        reference_range,
+        reference_source_range,
+        block_indices,
+        block_kinds,
+        primary_anchor,
+        variants,
+        unchanged_alternatives,
+    }
+}
+
+fn combined_alternative_source_range(segments: &[&BlockAlignmentSegment]) -> Range<usize> {
+    let start = segments
+        .iter()
+        .filter_map(|segment| match &segment.kind {
+            BlockAlignmentKind::Changed {
+                alternative_source_range,
+                ..
+            } => Some(alternative_source_range.start),
+            BlockAlignmentKind::Unchanged => None,
+        })
+        .min()
+        .unwrap_or(0);
+    let end = segments
+        .iter()
+        .filter_map(|segment| match &segment.kind {
+            BlockAlignmentKind::Changed {
+                alternative_source_range,
+                ..
+            } => Some(alternative_source_range.end),
+            BlockAlignmentKind::Unchanged => None,
+        })
+        .max()
+        .unwrap_or(start);
+
+    start..end
+}
+
+fn combined_replacement(segments: &[&BlockAlignmentSegment]) -> Vec<Token> {
+    segments
+        .iter()
+        .flat_map(|segment| match &segment.kind {
+            BlockAlignmentKind::Changed { replacement, .. } => replacement.clone(),
+            BlockAlignmentKind::Unchanged => Vec::new(),
+        })
+        .collect()
+}
+
+fn combined_change_weight(
+    reference_block_count: usize,
+    replacement_token_count: usize,
+    segments: &[&BlockAlignmentSegment],
+) -> ChangeWeight {
+    if segments.len() <= 1 {
+        return segments
+            .iter()
+            .find_map(|segment| match &segment.kind {
+                BlockAlignmentKind::Changed { weight, .. } => Some(*weight),
+                BlockAlignmentKind::Unchanged => None,
+            })
+            .unwrap_or(ChangeWeight::Small);
+    }
+
+    let size = reference_block_count.max(replacement_token_count);
+    if size <= 12 {
+        ChangeWeight::Medium
+    } else {
+        ChangeWeight::Large
+    }
+}
+
+fn build_insertion_variant_clusters(
+    reference: &NormalizedDocument,
+    reference_blocks: &[ReferenceBlock],
+    comparisons: &[Comparison],
+    alignments: &[BlockAlignment],
+) -> Vec<VariantCluster> {
+    let mut grouped: BTreeMap<usize, Vec<(usize, &BlockAlignmentSegment)>> = BTreeMap::new();
+
+    for (alternative_index, alignment) in alignments.iter().enumerate() {
+        for segment in alignment
+            .segments
+            .iter()
+            .filter(|segment| segment.reference_block_range.is_empty())
+        {
             grouped
-                .entry(variant_cluster_key(region))
+                .entry(segment.reference_block_range.start)
                 .or_default()
-                .push((alternative_index, comparison, region));
+                .push((alternative_index, segment));
         }
     }
 
     grouped
-        .into_values()
-        .map(|entries| {
-            let (_, _, first_region) = &entries[0];
+        .into_iter()
+        .map(|(boundary_index, entries)| {
+            let reference_range =
+                token_range_for_blocks(reference_blocks, boundary_index..boundary_index)
+                    .unwrap_or(0..0);
+            let reference_source_range =
+                source_span_for_token_range(&reference.token_ranges, reference_range.clone());
+            let primary_anchor = reference_blocks
+                .get(boundary_index)
+                .or_else(|| {
+                    boundary_index
+                        .checked_sub(1)
+                        .and_then(|index| reference_blocks.get(index))
+                })
+                .map(|block| block.anchor.clone());
             let mut seen = vec![false; comparisons.len()];
             let variants = entries
-                .iter()
-                .map(|(alternative_index, comparison, region)| {
-                    seen[*alternative_index] = true;
+                .into_iter()
+                .map(|(alternative_index, segment)| {
+                    seen[alternative_index] = true;
+                    let BlockAlignmentKind::Changed {
+                        alternative_source_range,
+                        weight,
+                        replacement,
+                        ..
+                    } = &segment.kind
+                    else {
+                        unreachable!("insertion segment should be marked as changed");
+                    };
+
                     RegionVariant {
-                        alternative_id: stable_alternative_id(comparison, *alternative_index),
-                        alternative_index: *alternative_index,
-                        alternative_source_range: region.alternative_source_range.clone(),
-                        weight: region.weight,
-                        replacement: region.replacement.clone(),
+                        alternative_id: stable_alternative_id(
+                            &comparisons[alternative_index],
+                            alternative_index,
+                        ),
+                        alternative_index,
+                        alternative_source_range: alternative_source_range.clone(),
+                        weight: *weight,
+                        replacement: replacement.clone(),
                     }
                 })
-                .collect();
+                .collect::<Vec<_>>();
             let unchanged_alternatives = comparisons
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| !seen[*index])
                 .map(|(index, comparison)| stable_alternative_id(comparison, index))
-                .collect();
+                .collect::<Vec<_>>();
 
             VariantCluster {
-                reference_range: first_region.reference_range.clone(),
-                reference_source_range: first_region.reference_source_range.clone(),
-                block_indices: first_region.block_indices.clone(),
-                block_kinds: first_region.block_kinds.clone(),
-                primary_anchor: first_region.primary_anchor.clone(),
+                reference_range,
+                reference_source_range,
+                block_indices: Vec::new(),
+                block_kinds: Vec::new(),
+                primary_anchor,
                 variants,
                 unchanged_alternatives,
             }
@@ -1227,29 +1582,45 @@ fn stable_alternative_id(comparison: &Comparison, alternative_index: usize) -> S
         .unwrap_or_else(|| format!("alternative-{alternative_index}"))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct VariantClusterKey {
-    reference_start: usize,
-    reference_end: usize,
-    anchor_key: Option<String>,
-}
-
-fn variant_cluster_key(region: &ChangeRegion) -> VariantClusterKey {
-    VariantClusterKey {
-        reference_start: region.reference_range.start,
-        reference_end: region.reference_range.end,
-        anchor_key: region
-            .primary_anchor
-            .as_ref()
-            .map(|anchor| anchor.block_key.clone()),
-    }
-}
-
 #[derive(Debug, Clone)]
 struct OpenBlock {
     kind: StructureKind,
     token_start: usize,
     anchor: BlockAnchor,
+}
+
+#[derive(Debug, Clone)]
+struct BlockAlignment {
+    segments: Vec<BlockAlignmentSegment>,
+}
+
+#[derive(Debug, Clone)]
+struct BlockAlignmentSegment {
+    reference_block_range: Range<usize>,
+    _alternative_block_range: Range<usize>,
+    kind: BlockAlignmentKind,
+}
+
+#[derive(Debug, Clone)]
+enum BlockAlignmentKind {
+    Unchanged,
+    Changed {
+        reference_source_range: Range<usize>,
+        alternative_source_range: Range<usize>,
+        weight: ChangeWeight,
+        replacement: Vec<Token>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JointBlockSlotKind {
+    Unchanged,
+    Changed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JointBlockSlot {
+    kind: JointBlockSlotKind,
 }
 
 #[derive(Debug, Clone)]
@@ -2126,7 +2497,9 @@ mod tests {
         }];
 
         assert_eq!(
-            build_comparison(&reference, &reference_blocks, &alternative, &options).substitutions,
+            build_comparison(&reference, &reference_blocks, &alternative, &options)
+                .0
+                .substitutions,
             vec![Substitution {
                 reference_range: 1..4,
                 reference_source_range: 1..4,
