@@ -1,0 +1,18 @@
+[package]
+name = "markalign"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+description = "Planned library for comparing Markdown documents at the syntax level"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+pulldown-cmark = { version = "0.13.4", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+similar = "3.1.0"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+serde_json = "1.0"

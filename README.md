@@ -1,33 +1,214 @@
 # markalign
 
-`markalign` is a planned Rust library crate to parse and compare two or more Markup source documents based on parsed Markup syntax.
+`markalign` is a Rust library crate for comparing Markup documents at the syntax level instead of as raw source text.
 
-This is more useful than comparing raw sourc documents, because often differences in sources make no difference for Markup, and often small changes in sources lead to big changes for Markup.
+The immediate target is Markdown. The long-term goal is to support additional Markup languages and, where useful, multiple parser backends.
 
-As a start, we will target MarkDown, using a popular suitable MarkDown parser. We hope to support other Markup languages or other parsers in the future.
+## Why
 
-The user will provide multiple Markup source document, of which one is the reference and the otehrs are alternatives as a reference, and one of more Markup documents s alternatives. Well, it is also possible to provide just one document, whichc means one reference and no alternatives, which is useful if you only want validation and parsing.
+Raw-text diffs are often a poor fit for Markup documents:
 
-A source document is a stream of Unicode characters that represents valid Markup. 
+- Different source forms can render to the same document.
+- Small source edits can produce large structural changes.
+- Formatting syntax can distract from the actual textual or structural change.
 
-There may be some pre-parse filtering such as UniCode normalization.
+`markalign` aims to compare documents after parsing, so the result reflects the Markup structure that a reader or renderer actually sees.
 
-A parser will parse the source document and `markalign` will use the result to create a stream of tokens. Every character to be displayed will become a character token. All structuring and formatting will be represented by format tokens. If a structuring or formatting applies to a portion of text, it will be represented by a start and an end token, enclosing the text to which it applies.
+## Scope
 
-Then, each alternative token stream will be compared to the reference token stream using the [similar crate](https://crates.io/crates/similar) to get a diff stream of tokens that are equal, tokes that are removed and tokens that are added.
+The library accepts one reference document and zero or more alternative documents.
 
-Then, the diff stream is consolidated. Consecutive remove and add tokens are consolidated into a single substitution. Consecutive character tokens are consolidated into a single string token.
+- With one input document, `markalign` can be used for validation, parsing, and normalization.
+- With multiple input documents, `markalign` compares each alternative against the reference.
 
-Consolidation can also remove spurious equalities, that is, small pieces of text that happen to occurr in both the reference and one of the alternatives, but are probably insignificant, will be merged into substitutions.
+A document is a stream of Unicode characters representing Markup source.
 
-Consolidation can also be used to remove undesired Markup features.
+## Pipeline
 
-In the end, we have a stream of tokens representing the compiled reference, which can easily be converted to, for example, HTML. 
+The current implementation follows this pipeline:
 
-It also contains tokens that mark the begining and end of each piece of the reference that would need to be replaced to turn the reference into one of the alternatives. IN other words, each alternative is represented as a list of substitions that would need to be applied to the reference. For example:
+1. Apply optional pre-parse normalization such as Unicode normalization.
+2. Parse each source document with a Markdown parser.
+3. Convert each parsed document into a normalized token stream.
+4. Diff each alternative token stream against the reference token stream.
+5. Consolidate the raw diff into higher-level substitutions.
+6. Serialize or render the result into downstream formats.
 
- * If an alternative is identical to the reference, the list of substitutions is empty.
- * If an alternative is completely different from the reference, it will be one substitution, which consists of replacing the entire reference with the entire alternative.
- * If the alternative is essentially the reference with some minor edits, then it is a list of substitutions reflecting these edits
+## Version 1
 
-`markalign` will also support serialization of the result.
+The first implementation is intentionally narrow.
+
+- Target only Markdown.
+- Support exactly one parser backend: [`pulldown-cmark`](https://docs.rs/crate/pulldown-cmark/latest).
+- Produce a stable normalized token stream.
+- Compare one reference against one or more alternatives.
+- Return substitutions that describe how to transform the reference into each alternative.
+
+Anything beyond that should be treated as a later extension, not as part of the initial build.
+
+## API
+
+The main entry points are:
+
+- `normalize_document`: parse one Markdown document and return its normalized token stream.
+- `compare_pair`: compare one reference document against one alternative.
+- `compare_many`: compare one reference document against zero or more alternatives.
+
+Example:
+
+```rust
+use markalign::{Document, Options, compare_pair, normalize_document};
+
+let options = Options::default();
+let reference = Document::with_id("reference", "Hello *world*.");
+let alternative = Document::with_id("alternative", "Hello _world_.");
+
+let normalized = normalize_document(&reference, &options)?;
+let comparison = compare_pair(&reference, &alternative, &options)?;
+
+assert!(!normalized.tokens.is_empty());
+assert!(comparison.comparisons[0].substitutions.is_empty());
+# Ok::<(), markalign::Error>(())
+```
+
+## Core Model
+
+The public API is built around these core types:
+
+- `Document`: one parsed and normalized source document.
+- `Token`: one unit in the normalized syntax stream.
+- `Diff`: a token-level comparison between a reference and an alternative.
+- `Substitution`: one contiguous replacement of part of the reference with part of an alternative.
+- `Comparison`: the full result for one reference and one alternative.
+- `ComparisonSet`: the full result for comparing one reference against all alternatives.
+- `SourceSpan`: a byte range plus line and column positions.
+
+For `v1`, tokenization should favor determinism over richness. If a syntax detail is not needed for comparison, it should be normalized away instead of preserved by default.
+
+## Tokenization
+
+The working idea is:
+
+- Visible text becomes text tokens.
+- Structural or formatting boundaries become explicit tokens.
+- A formatting region can be represented by matching start and end tokens around the enclosed content.
+
+For example, emphasis, strong emphasis, links, headings, paragraphs, and list items can all be represented by structure tokens plus text tokens.
+
+For `v1`, the parser backend is `pulldown-cmark`, and the normalized token model is intentionally narrower than the full parser event space. Unsupported Markdown-adjacent features such as inline HTML are currently rejected instead of being normalized silently.
+
+## Diff And Consolidation
+
+Each alternative token stream is compared to the reference token stream. The current implementation uses the [`similar`](https://docs.rs/crate/similar/latest) crate with a token-sequence diff.
+
+The raw diff is then consolidated:
+
+- Adjacent removals and additions become a single substitution.
+- Adjacent text tokens can be merged into larger text spans.
+- Small accidental equalities can be absorbed into nearby substitutions when that produces a more meaningful result.
+- Markup features that are intentionally ignored by the chosen normalization can be removed before or during consolidation.
+
+The result should prefer human-meaningful edits over mechanically minimal token edits.
+
+In the current `v1` implementation, consolidation is still intentionally simple: it groups contiguous replace, insert, and delete regions into substitutions, and it can absorb small equal token runs between surrounding changes.
+
+## Output
+
+The final result should make two things available:
+
+- A normalized representation of the reference document.
+- For each alternative, a list of substitutions that would transform the reference into that alternative.
+- Source ranges for normalized tokens and substitutions, so downstream tooling can map results back to the original Markdown.
+- A source-map-style position model that can convert byte ranges into line and column spans.
+- Serde-compatible data structures for serializing comparison results.
+
+Examples:
+
+- If an alternative is identical to the reference, the substitution list is empty.
+- If an alternative is completely different, the result may be a single substitution replacing the whole reference.
+- If an alternative differs only in a few local edits, the result should be a short list of local substitutions.
+
+The result should also be serializable.
+
+## Non-Goals For Version 1
+
+To keep the first implementation tractable, `v1` should not try to solve all Markdown edge cases at once.
+
+- No support for multiple Markup languages.
+- No support for multiple parser backends.
+- No attempt to preserve every source-level formatting choice.
+- No guarantee yet that all Markdown constructs will receive specialized token types.
+
+## Open Design Questions
+
+The following questions should be resolved before implementation gets deep:
+
+- Which source differences should normalize to the same token stream?
+- How should links, code spans, HTML-in-Markdown, and reference-style constructs be represented?
+- When should small equal regions be merged into a surrounding substitution?
+- Which serialized fields should be guaranteed as long-term stable API?
+
+## Worked Examples
+
+These examples are intentionally schematic. They describe the behavior, not the final wire format.
+
+### Example 1: Equivalent Markdown Source
+
+Reference:
+
+```md
+Hello *world*.
+```
+
+Alternative:
+
+```md
+Hello _world_.
+```
+
+Expected outcome:
+
+- Both documents normalize to the same token stream.
+- The substitution list is empty.
+
+### Example 2: Local Text Edit
+
+Reference:
+
+```md
+Hello *world*.
+```
+
+Alternative:
+
+```md
+Hello *there*.
+```
+
+Expected outcome:
+
+- The surrounding emphasis structure remains aligned.
+- One substitution replaces `world` with `there`.
+
+### Example 3: Structural Change
+
+Reference:
+
+```md
+- one
+- two
+```
+
+Alternative:
+
+```md
+1. one
+2. two
+```
+
+Expected outcome:
+
+- If unordered and ordered lists are treated as meaningfully different in `v1`, this becomes a structural substitution.
+- If the chosen normalization intentionally erases that distinction, the substitution list is empty.
+
+This kind of case should be decided explicitly by the token model, not left accidental.
