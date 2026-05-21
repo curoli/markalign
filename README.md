@@ -146,6 +146,8 @@ For higher-level integrations, each comparison also exposes:
 
 If `Options::block_level_changes_only` is enabled, `markalign` emphasizes block-level change regions instead of detailed substitutions.
 
+Block regions are now aligned in two phases: first by structural block identity, then by block content. That lets `markalign` treat small inline edits inside the same paragraph or heading differently from full block replacement.
+
 ## Markdown Support
 
 `v1` deliberately supports a small Markdown subset.

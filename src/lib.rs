@@ -626,19 +626,17 @@ fn build_blocks(document: &NormalizedDocument) -> Vec<ReferenceBlock> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct BlockSignature {
+struct BlockMatchKey {
     kind: BlockKind,
     heading_path: Vec<usize>,
     list_item_index: Option<usize>,
-    text: String,
 }
 
-fn block_signature(block: &ReferenceBlock) -> BlockSignature {
-    BlockSignature {
+fn block_match_key(block: &ReferenceBlock) -> BlockMatchKey {
+    BlockMatchKey {
         kind: block.kind.clone(),
         heading_path: block.anchor.heading_path.clone(),
         list_item_index: block.anchor.list_item_index,
-        text: block.text.clone(),
     }
 }
 
@@ -682,8 +680,8 @@ fn build_block_regions(
     alternative: &NormalizedDocument,
     alternative_blocks: &[ReferenceBlock],
 ) -> (Vec<ChangeRegion>, Vec<UnchangedRegion>) {
-    let reference_signatures: Vec<_> = reference_blocks.iter().map(block_signature).collect();
-    let alternative_signatures: Vec<_> = alternative_blocks.iter().map(block_signature).collect();
+    let reference_signatures: Vec<_> = reference_blocks.iter().map(block_match_key).collect();
+    let alternative_signatures: Vec<_> = alternative_blocks.iter().map(block_match_key).collect();
     let ops = capture_diff_slices(
         Algorithm::Myers,
         &reference_signatures,
@@ -695,10 +693,36 @@ fn build_block_regions(
     for op in ops {
         match op.tag() {
             DiffTag::Equal => {
-                if let Some(region) =
-                    unchanged_region_for_block_range(op.old_range(), reference, reference_blocks)
-                {
-                    unchanged_regions.push(region);
+                let old_range = op.old_range();
+                let new_range = op.new_range();
+
+                for offset in 0..old_range.len() {
+                    let reference_index = old_range.start + offset;
+                    let alternative_index = new_range.start + offset;
+
+                    if block_content_equal(
+                        reference,
+                        &reference_blocks[reference_index],
+                        alternative,
+                        &alternative_blocks[alternative_index],
+                    ) {
+                        if let Some(region) = unchanged_region_for_block_range(
+                            reference_index..(reference_index + 1),
+                            reference,
+                            reference_blocks,
+                        ) {
+                            unchanged_regions.push(region);
+                        }
+                    } else {
+                        changed_regions.push(change_region_for_matched_blocks(
+                            reference_index,
+                            alternative_index,
+                            reference,
+                            reference_blocks,
+                            alternative,
+                            alternative_blocks,
+                        ));
+                    }
                 }
             }
             DiffTag::Delete | DiffTag::Insert | DiffTag::Replace => {
@@ -715,6 +739,34 @@ fn build_block_regions(
     }
 
     (changed_regions, unchanged_regions)
+}
+
+fn block_content_equal(
+    reference: &NormalizedDocument,
+    reference_block: &ReferenceBlock,
+    alternative: &NormalizedDocument,
+    alternative_block: &ReferenceBlock,
+) -> bool {
+    reference.tokens[reference_block.token_range.clone()]
+        == alternative.tokens[alternative_block.token_range.clone()]
+}
+
+fn change_region_for_matched_blocks(
+    reference_index: usize,
+    alternative_index: usize,
+    reference: &NormalizedDocument,
+    reference_blocks: &[ReferenceBlock],
+    alternative: &NormalizedDocument,
+    alternative_blocks: &[ReferenceBlock],
+) -> ChangeRegion {
+    change_region_for_block_ranges(
+        reference_index..(reference_index + 1),
+        alternative_index..(alternative_index + 1),
+        reference,
+        reference_blocks,
+        alternative,
+        alternative_blocks,
+    )
 }
 
 fn change_region_for_block_ranges(
@@ -840,26 +892,50 @@ fn change_weight_for_block_ranges(
     let block_span = reference_count.max(alternative_count);
 
     if block_span == 1 {
-        let reference_text = reference_blocks
-            .get(reference_block_range.start)
+        let reference_block = reference_blocks.get(reference_block_range.start);
+        let alternative_block = alternative_blocks.get(alternative_block_range.start);
+        let reference_text = reference_block
             .map(|block| block.text.as_str())
             .unwrap_or("");
-        let alternative_text = alternative_blocks
-            .get(alternative_block_range.start)
+        let alternative_text = alternative_block
             .map(|block| block.text.as_str())
             .unwrap_or("");
         let char_delta = reference_text.len().abs_diff(alternative_text.len());
+        let shared_prefix = shared_prefix_len(reference_text, alternative_text);
+        let shared_suffix = shared_suffix_len(reference_text, alternative_text);
+        let shared = shared_prefix.saturating_add(shared_suffix);
+        let max_len = reference_text.len().max(alternative_text.len());
+        let changed = max_len.saturating_sub(shared.min(max_len));
 
-        if char_delta <= 16 {
+        if changed <= 24 && char_delta <= 24 {
             ChangeWeight::Small
-        } else {
+        } else if changed <= 120 {
             ChangeWeight::Medium
+        } else {
+            ChangeWeight::Large
         }
     } else if block_span <= 2 {
         ChangeWeight::Medium
     } else {
         ChangeWeight::Large
     }
+}
+
+fn shared_prefix_len(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .map(|(ch, _)| ch.len_utf8())
+        .sum()
+}
+
+fn shared_suffix_len(left: &str, right: &str) -> usize {
+    left.chars()
+        .rev()
+        .zip(right.chars().rev())
+        .take_while(|(left, right)| left == right)
+        .map(|(ch, _)| ch.len_utf8())
+        .sum()
 }
 
 #[allow(clippy::ptr_arg)]
@@ -1842,6 +1918,51 @@ mod tests {
         assert_eq!(result.reference_blocks[1].kind, BlockKind::Paragraph);
         assert!(result.comparison_by_id("a").is_some());
         assert_eq!(result.comparison_index.get("b"), Some(&1));
+    }
+
+    #[test]
+    fn block_alignment_treats_inline_edit_as_local_change() {
+        let options = Options::default();
+        let result = compare_pair(
+            &Document::new("# Title\n\nHello world.\n"),
+            &Document::new("# Title\n\nHello there.\n"),
+            &options,
+        )
+        .unwrap();
+        let comparison = &result.comparisons[0];
+
+        assert_eq!(comparison.changed_regions.len(), 1);
+        assert_eq!(
+            comparison.changed_regions[0].block_kinds,
+            vec![BlockKind::Paragraph]
+        );
+        assert_eq!(comparison.changed_regions[0].weight, ChangeWeight::Small);
+        assert_eq!(
+            comparison.changed_regions[0]
+                .primary_anchor
+                .as_ref()
+                .map(|anchor| anchor.block_index),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn block_alignment_distinguishes_larger_block_replacement() {
+        let options = Options::default();
+        let result = compare_pair(
+            &Document::new("Short.\n"),
+            &Document::new(
+                "This is a much longer paragraph with several more words and a different structure.\n",
+            ),
+            &options,
+        )
+        .unwrap();
+
+        assert_eq!(result.comparisons[0].changed_regions.len(), 1);
+        assert!(matches!(
+            result.comparisons[0].changed_regions[0].weight,
+            ChangeWeight::Medium | ChangeWeight::Large
+        ));
     }
 
     #[test]
