@@ -227,12 +227,13 @@ impl Substitution {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Comparison {
     pub alternative_id: Option<String>,
+    pub alternative_blocks: Vec<ReferenceBlock>,
     pub substitutions: Vec<Substitution>,
     pub changed_regions: Vec<ChangeRegion>,
     pub unchanged_regions: Vec<UnchangedRegion>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum BlockKind {
     Paragraph,
@@ -456,10 +457,9 @@ fn build_comparison(
     alternative: &NormalizedDocument,
     options: &Options,
 ) -> Comparison {
+    let alternative_blocks = build_blocks(alternative);
     let ops = capture_diff_slices(Algorithm::Myers, &reference.tokens, &alternative.tokens);
     let mut substitutions = Vec::new();
-    let mut changed_regions = Vec::new();
-    let mut unchanged_regions = Vec::new();
     let mut pending: Option<PendingSubstitution> = None;
 
     for (index, op) in ops.iter().enumerate() {
@@ -478,20 +478,7 @@ fn build_comparison(
                         .extend(old_range, new_range);
                 } else {
                     if let Some(pending) = pending.take() {
-                        let substitution = pending.finish(reference, alternative);
-                        substitutions.push(substitution.clone());
-                        changed_regions.push(change_region_for_substitution(
-                            &substitution,
-                            reference_blocks,
-                        ));
-                    }
-
-                    if !op.old_range().is_empty() {
-                        unchanged_regions.push(unchanged_region_for_range(
-                            op.old_range(),
-                            reference,
-                            reference_blocks,
-                        ));
+                        substitutions.push(pending.finish(reference, alternative));
                     }
                 }
             }
@@ -508,13 +495,15 @@ fn build_comparison(
     }
 
     if let Some(pending) = pending.take() {
-        let substitution = pending.finish(reference, alternative);
-        substitutions.push(substitution.clone());
-        changed_regions.push(change_region_for_substitution(
-            &substitution,
-            reference_blocks,
-        ));
+        substitutions.push(pending.finish(reference, alternative));
     }
+
+    let (mut changed_regions, unchanged_regions) = build_block_regions(
+        reference,
+        reference_blocks,
+        alternative,
+        &alternative_blocks,
+    );
 
     merge_adjacent_changed_regions(&mut changed_regions, options.merge_adjacent_regions_up_to);
 
@@ -525,6 +514,7 @@ fn build_comparison(
 
     Comparison {
         alternative_id: alternative.document_id.clone(),
+        alternative_blocks,
         substitutions,
         changed_regions,
         unchanged_regions,
@@ -549,13 +539,17 @@ fn markdown_options(options: &Options) -> MarkdownOptions {
 }
 
 fn build_reference_blocks(reference: &NormalizedDocument) -> Vec<ReferenceBlock> {
+    build_blocks(reference)
+}
+
+fn build_blocks(document: &NormalizedDocument) -> Vec<ReferenceBlock> {
     let mut blocks = Vec::new();
     let mut open_blocks: Vec<OpenBlock> = Vec::new();
     let mut active_block_indices = Vec::new();
     let mut heading_path = Vec::new();
     let mut list_item_counters = Vec::new();
 
-    for (index, token) in reference.tokens.iter().enumerate() {
+    for (index, token) in document.tokens.iter().enumerate() {
         match token {
             Token::Start(StructureKind::List { .. }) => list_item_counters.push(0),
             Token::End(StructureKind::List { .. }) => {
@@ -614,8 +608,8 @@ fn build_reference_blocks(reference: &NormalizedDocument) -> Vec<ReferenceBlock>
                     active_block_indices.pop();
                     let token_range = open.token_start..(index + 1);
                     let source_range =
-                        source_span_for_token_range(&reference.token_ranges, token_range.clone());
-                    let text = visible_text_for_range(&reference.tokens, token_range.clone());
+                        source_span_for_token_range(&document.token_ranges, token_range.clone());
+                    let text = visible_text_for_range(&document.tokens, token_range.clone());
 
                     if let Some(block) = blocks.get_mut(open.anchor.block_index) {
                         block.token_range = token_range;
@@ -629,6 +623,23 @@ fn build_reference_blocks(reference: &NormalizedDocument) -> Vec<ReferenceBlock>
     }
 
     blocks
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct BlockSignature {
+    kind: BlockKind,
+    heading_path: Vec<usize>,
+    list_item_index: Option<usize>,
+    text: String,
+}
+
+fn block_signature(block: &ReferenceBlock) -> BlockSignature {
+    BlockSignature {
+        kind: block.kind.clone(),
+        heading_path: block.anchor.heading_path.clone(),
+        list_item_index: block.anchor.list_item_index,
+        text: block.text.clone(),
+    }
 }
 
 fn block_kind_for_structure(kind: StructureKind) -> Option<BlockKind> {
@@ -665,39 +676,106 @@ fn visible_text_for_range(tokens: &[Token], token_range: Range<usize>) -> String
     text
 }
 
-fn change_region_for_substitution(
-    substitution: &Substitution,
+fn build_block_regions(
+    reference: &NormalizedDocument,
     reference_blocks: &[ReferenceBlock],
+    alternative: &NormalizedDocument,
+    alternative_blocks: &[ReferenceBlock],
+) -> (Vec<ChangeRegion>, Vec<UnchangedRegion>) {
+    let reference_signatures: Vec<_> = reference_blocks.iter().map(block_signature).collect();
+    let alternative_signatures: Vec<_> = alternative_blocks.iter().map(block_signature).collect();
+    let ops = capture_diff_slices(
+        Algorithm::Myers,
+        &reference_signatures,
+        &alternative_signatures,
+    );
+    let mut changed_regions = Vec::new();
+    let mut unchanged_regions = Vec::new();
+
+    for op in ops {
+        match op.tag() {
+            DiffTag::Equal => {
+                if let Some(region) =
+                    unchanged_region_for_block_range(op.old_range(), reference, reference_blocks)
+                {
+                    unchanged_regions.push(region);
+                }
+            }
+            DiffTag::Delete | DiffTag::Insert | DiffTag::Replace => {
+                changed_regions.push(change_region_for_block_ranges(
+                    op.old_range(),
+                    op.new_range(),
+                    reference,
+                    reference_blocks,
+                    alternative,
+                    alternative_blocks,
+                ));
+            }
+        }
+    }
+
+    (changed_regions, unchanged_regions)
+}
+
+fn change_region_for_block_ranges(
+    reference_block_range: Range<usize>,
+    alternative_block_range: Range<usize>,
+    reference: &NormalizedDocument,
+    reference_blocks: &[ReferenceBlock],
+    alternative: &NormalizedDocument,
+    alternative_blocks: &[ReferenceBlock],
 ) -> ChangeRegion {
-    let block_indices = overlapping_block_indices(&substitution.reference_range, reference_blocks);
+    let reference_range =
+        token_range_for_blocks(reference_blocks, reference_block_range.clone()).unwrap_or(0..0);
+    let alternative_range =
+        token_range_for_blocks(alternative_blocks, alternative_block_range.clone()).unwrap_or(0..0);
+    let block_indices: Vec<_> = reference_block_range.clone().collect();
     let block_kinds = block_indices
         .iter()
         .filter_map(|index| reference_blocks.get(*index))
         .map(|block| block.kind.clone())
         .collect();
-    let primary_anchor = block_indices
-        .first()
-        .and_then(|index| reference_blocks.get(*index))
+    let primary_anchor = reference_block_range
+        .start
+        .checked_sub(0)
+        .and_then(|index| reference_blocks.get(index))
         .map(|block| block.anchor.clone());
+    let replacement = if alternative_range.is_empty() {
+        Vec::new()
+    } else {
+        alternative.tokens[alternative_range.clone()].to_vec()
+    };
 
     ChangeRegion {
-        reference_range: substitution.reference_range.clone(),
-        reference_source_range: substitution.reference_source_range.clone(),
-        alternative_source_range: substitution.alternative_source_range.clone(),
+        reference_source_range: source_span_for_token_range(
+            &reference.token_ranges,
+            reference_range.clone(),
+        ),
+        alternative_source_range: source_span_for_token_range(
+            &alternative.token_ranges,
+            alternative_range.clone(),
+        ),
+        weight: change_weight_for_block_ranges(
+            &reference_block_range,
+            &alternative_block_range,
+            reference_blocks,
+            alternative_blocks,
+        ),
+        reference_range,
         block_indices,
         block_kinds,
         primary_anchor,
-        weight: change_weight_for_range(&substitution.reference_range, &substitution.replacement),
-        replacement: substitution.replacement.clone(),
+        replacement,
     }
 }
 
-fn unchanged_region_for_range(
-    reference_range: Range<usize>,
+fn unchanged_region_for_block_range(
+    reference_block_range: Range<usize>,
     reference: &NormalizedDocument,
     reference_blocks: &[ReferenceBlock],
-) -> UnchangedRegion {
-    let block_indices = overlapping_block_indices(&reference_range, reference_blocks);
+) -> Option<UnchangedRegion> {
+    let reference_range = token_range_for_blocks(reference_blocks, reference_block_range.clone())?;
+    let block_indices: Vec<_> = reference_block_range.collect();
     let block_kinds = block_indices
         .iter()
         .filter_map(|index| reference_blocks.get(*index))
@@ -708,7 +786,7 @@ fn unchanged_region_for_range(
         .and_then(|index| reference_blocks.get(*index))
         .map(|block| block.anchor.clone());
 
-    UnchangedRegion {
+    Some(UnchangedRegion {
         reference_source_range: source_span_for_token_range(
             &reference.token_ranges,
             reference_range.clone(),
@@ -717,22 +795,26 @@ fn unchanged_region_for_range(
         block_indices,
         block_kinds,
         primary_anchor,
+    })
+}
+
+fn token_range_for_blocks(
+    blocks: &[ReferenceBlock],
+    block_range: Range<usize>,
+) -> Option<Range<usize>> {
+    if block_range.is_empty() {
+        if block_range.start == 0 {
+            return Some(0..0);
+        }
+
+        let previous = blocks.get(block_range.start.saturating_sub(1))?;
+        return Some(previous.token_range.end..previous.token_range.end);
     }
-}
 
-fn overlapping_block_indices(
-    reference_range: &Range<usize>,
-    reference_blocks: &[ReferenceBlock],
-) -> Vec<usize> {
-    reference_blocks
-        .iter()
-        .filter(|block| ranges_overlap(reference_range, &block.token_range))
-        .map(|block| block.index)
-        .collect()
-}
+    let first = blocks.get(block_range.start)?;
+    let last = blocks.get(block_range.end.saturating_sub(1))?;
 
-fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
-    left.start < right.end && right.start < left.end
+    Some(first.token_range.start..last.token_range.end)
 }
 
 fn change_weight_for_range(reference_range: &Range<usize>, replacement: &[Token]) -> ChangeWeight {
@@ -741,6 +823,39 @@ fn change_weight_for_range(reference_range: &Range<usize>, replacement: &[Token]
     if size <= 3 {
         ChangeWeight::Small
     } else if size <= 12 {
+        ChangeWeight::Medium
+    } else {
+        ChangeWeight::Large
+    }
+}
+
+fn change_weight_for_block_ranges(
+    reference_block_range: &Range<usize>,
+    alternative_block_range: &Range<usize>,
+    reference_blocks: &[ReferenceBlock],
+    alternative_blocks: &[ReferenceBlock],
+) -> ChangeWeight {
+    let reference_count = reference_block_range.len();
+    let alternative_count = alternative_block_range.len();
+    let block_span = reference_count.max(alternative_count);
+
+    if block_span == 1 {
+        let reference_text = reference_blocks
+            .get(reference_block_range.start)
+            .map(|block| block.text.as_str())
+            .unwrap_or("");
+        let alternative_text = alternative_blocks
+            .get(alternative_block_range.start)
+            .map(|block| block.text.as_str())
+            .unwrap_or("");
+        let char_delta = reference_text.len().abs_diff(alternative_text.len());
+
+        if char_delta <= 16 {
+            ChangeWeight::Small
+        } else {
+            ChangeWeight::Medium
+        }
+    } else if block_span <= 2 {
         ChangeWeight::Medium
     } else {
         ChangeWeight::Large
