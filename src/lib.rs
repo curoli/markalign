@@ -879,6 +879,113 @@ mod tests {
     }
 
     #[test]
+    fn preserves_heading_level() {
+        let options = Options::default();
+        let normalized = normalize_document(&Document::new("### Title"), &options).unwrap();
+
+        assert_eq!(
+            normalized.tokens,
+            vec![
+                Token::Start(StructureKind::Heading { level: 3 }),
+                Token::Text("Title".to_string()),
+                Token::End(StructureKind::Heading { level: 3 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_nested_emphasis_structure() {
+        let options = Options::default();
+        let normalized = normalize_document(&Document::new("***bold italic***"), &options).unwrap();
+
+        assert_eq!(
+            normalized.tokens,
+            vec![
+                Token::Start(StructureKind::Paragraph),
+                Token::Start(StructureKind::Emphasis),
+                Token::Start(StructureKind::Strong),
+                Token::Text("bold".to_string()),
+                Token::Text(" ".to_string()),
+                Token::Text("italic".to_string()),
+                Token::End(StructureKind::Strong),
+                Token::End(StructureKind::Emphasis),
+                Token::End(StructureKind::Paragraph),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_ordered_and_unordered_list_kinds_by_default() {
+        let options = Options::default();
+        let bullet = normalize_document(&Document::new("- one\n"), &options).unwrap();
+        let ordered = normalize_document(&Document::new("1. one\n"), &options).unwrap();
+
+        assert!(
+            bullet
+                .tokens
+                .contains(&Token::Start(StructureKind::List { ordered: false }))
+        );
+        assert!(
+            ordered
+                .tokens
+                .contains(&Token::Start(StructureKind::List { ordered: true }))
+        );
+        assert_ne!(bullet.tokens, ordered.tokens);
+    }
+
+    #[test]
+    fn preserves_inline_code() {
+        let options = Options::default();
+        let normalized = normalize_document(&Document::new("Use `code` here."), &options).unwrap();
+
+        assert!(
+            normalized
+                .tokens
+                .contains(&Token::Atom(AtomKind::InlineCode("code".to_string())))
+        );
+    }
+
+    #[test]
+    fn preserves_fenced_code_block_language() {
+        let options = Options::default();
+        let normalized =
+            normalize_document(&Document::new("```rust\nfn main() {}\n```"), &options).unwrap();
+
+        assert!(
+            normalized
+                .tokens
+                .contains(&Token::Start(StructureKind::CodeBlock))
+        );
+        assert!(
+            normalized
+                .tokens
+                .contains(&Token::Atom(AtomKind::CodeBlockLanguage(Some(
+                    "rust".to_string()
+                ))))
+        );
+    }
+
+    #[test]
+    fn preserves_soft_and_hard_breaks() {
+        let options = Options::default();
+        let soft = normalize_document(&Document::new("one\ntwo"), &options).unwrap();
+        let hard = normalize_document(&Document::new("one  \ntwo"), &options).unwrap();
+
+        assert!(soft.tokens.contains(&Token::Atom(AtomKind::SoftBreak)));
+        assert!(hard.tokens.contains(&Token::Atom(AtomKind::HardBreak)));
+    }
+
+    #[test]
+    fn rejects_inline_html() {
+        let options = Options::default();
+
+        assert!(matches!(
+            normalize_document(&Document::new("<span>html</span>"), &options),
+            Err(Error::UnsupportedFeature { .. })
+        ));
+    }
+
+    #[test]
     fn compare_pair_returns_empty_substitutions_for_identical_normalization() {
         let options = Options::default();
         let reference = Document::new("Hello *world*.");

@@ -60,6 +60,12 @@ The first implementation is intentionally narrow.
 
 Anything beyond that should be treated as a later extension, not as part of the initial build.
 
+## Release Status
+
+`0.1.0` is intended as an early API release. The Rust API follows Cargo's normal pre-1.0 SemVer expectations: breaking changes may still happen in `0.x` minor releases.
+
+Tokenization details and serialized JSON output are tested, but they are not yet long-term stable formats. Downstream users should treat them as useful integration points for experimentation rather than permanent interchange formats.
+
 ## API
 
 The main entry points are:
@@ -144,9 +150,9 @@ Text diffs are finer than whole parser text events: visible text is split into w
 | Thematic breaks | Supported | Preserved as an atom token. |
 | Soft and hard breaks | Supported | Preserved as atom tokens. |
 | Inline HTML and block HTML | Rejected | Returns `UnsupportedFeature`. |
-| Footnotes | Rejected | Returns `UnsupportedFeature`. |
-| Math | Rejected | Returns `UnsupportedFeature`. |
-| Task lists | Rejected | Returns `UnsupportedFeature`. |
+| Footnotes | Not enabled | Parsed as ordinary Markdown text with the current parser options. |
+| Math | Not enabled | Parsed as ordinary Markdown text with the current parser options. |
+| Task lists | Not enabled | Parsed as ordinary Markdown list text with the current parser options. |
 
 ## Output
 
