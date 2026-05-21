@@ -89,7 +89,7 @@ For `v1`, tokenization should favor determinism over richness. If a syntax detai
 
 The working idea is:
 
-- Visible text becomes text tokens.
+- Visible text becomes text tokens split into word, whitespace, and punctuation chunks.
 - Structural or formatting boundaries become explicit tokens.
 - A formatting region can be represented by matching start and end tokens around the enclosed content.
 
@@ -111,6 +111,28 @@ The raw diff is then consolidated:
 The result should prefer human-meaningful edits over mechanically minimal token edits.
 
 In the current `v1` implementation, consolidation is still intentionally simple: it groups contiguous replace, insert, and delete regions into substitutions, and it can absorb small equal token runs between surrounding changes.
+
+Text diffs are finer than whole parser text events: visible text is split into word, whitespace, and punctuation chunks before diffing. This keeps common edits such as `Hello world.` to `Hello there.` localized to the changed word.
+
+## Markdown Support
+
+`v1` deliberately supports a small Markdown subset.
+
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Paragraphs | Supported | Represented as start and end structure tokens. |
+| Headings | Supported | Heading level is preserved. |
+| Emphasis and strong emphasis | Supported | Source spelling such as `*` vs `_` is normalized away. |
+| Links and images | Supported | Destination and title are preserved as atom tokens. |
+| Ordered and unordered lists | Supported | List kind is preserved by default and can be normalized with `equate_list_kinds`. |
+| Inline code | Supported | Preserved as an atom token. |
+| Code blocks | Partial | Code block structure and fenced language are preserved. |
+| Thematic breaks | Supported | Preserved as an atom token. |
+| Soft and hard breaks | Supported | Preserved as atom tokens. |
+| Inline HTML and block HTML | Rejected | Returns `UnsupportedFeature`. |
+| Footnotes | Rejected | Returns `UnsupportedFeature`. |
+| Math | Rejected | Returns `UnsupportedFeature`. |
+| Task lists | Rejected | Returns `UnsupportedFeature`. |
 
 ## Output
 

@@ -452,12 +452,7 @@ fn push_event(
         Event::Start(tag) => push_start_tag(tokens, token_ranges, tag, source_range, options),
         Event::End(tag_end) => push_end_tag(tokens, token_ranges, tag_end, source_range, options),
         Event::Text(text) => {
-            push_token(
-                tokens,
-                token_ranges,
-                Token::Text(text.into_string()),
-                source_range,
-            );
+            push_text_tokens(tokens, token_ranges, text.as_ref(), source_range);
             Ok(())
         }
         Event::Code(code) => {
@@ -737,6 +732,68 @@ fn push_token(
     token_ranges.push(source_range);
 }
 
+fn push_text_tokens(
+    tokens: &mut Vec<Token>,
+    token_ranges: &mut Vec<Range<usize>>,
+    text: &str,
+    source_range: Range<usize>,
+) {
+    for chunk in text_chunks(text) {
+        push_token(
+            tokens,
+            token_ranges,
+            Token::Text(text[chunk.clone()].to_string()),
+            source_range.start + chunk.start..source_range.start + chunk.end,
+        );
+    }
+}
+
+fn text_chunks(text: &str) -> Vec<Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut current_start = None;
+    let mut current_kind = None;
+
+    for (index, ch) in text.char_indices() {
+        let kind = TextChunkKind::for_char(ch);
+
+        if current_kind.is_some_and(|current| current == kind) {
+            continue;
+        }
+
+        if let Some(start) = current_start {
+            chunks.push(start..index);
+        }
+
+        current_start = Some(index);
+        current_kind = Some(kind);
+    }
+
+    if let Some(start) = current_start {
+        chunks.push(start..text.len());
+    }
+
+    chunks
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextChunkKind {
+    Word,
+    Whitespace,
+    Punctuation,
+}
+
+impl TextChunkKind {
+    fn for_char(ch: char) -> Self {
+        if ch.is_alphanumeric() {
+            Self::Word
+        } else if ch.is_whitespace() {
+            Self::Whitespace
+        } else {
+            Self::Punctuation
+        }
+    }
+}
+
 fn heading_level_to_u8(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -821,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn compare_pair_falls_back_to_whole_document_substitution() {
+    fn compare_pair_returns_local_word_substitution() {
         let options = Options::default();
         let reference = Document::new("Hello *world*.");
         let alternative = Document::new("Hello *there*.");
@@ -832,7 +889,7 @@ mod tests {
         assert_eq!(
             result.comparisons[0].substitutions[0],
             Substitution {
-                reference_range: 3..4,
+                reference_range: 4..5,
                 reference_source_range: 7..12,
                 alternative_source_range: 7..12,
                 replacement: vec![Token::Text("there".to_string())],
@@ -892,7 +949,27 @@ mod tests {
 
         assert_eq!(normalized.tokens.len(), normalized.token_ranges.len());
         assert_eq!(normalized.token_ranges[0], 0..14);
-        assert_eq!(normalized.token_ranges[3], 7..12);
+        assert_eq!(normalized.token_ranges[4], 7..12);
+    }
+
+    #[test]
+    fn text_is_split_into_word_space_and_punctuation_chunks() {
+        let options = Options::default();
+        let document = Document::new("Hello world.");
+        let normalized = normalize_document(&document, &options).unwrap();
+
+        assert_eq!(
+            normalized.tokens,
+            vec![
+                Token::Start(StructureKind::Paragraph),
+                Token::Text("Hello".to_string()),
+                Token::Text(" ".to_string()),
+                Token::Text("world".to_string()),
+                Token::Text(".".to_string()),
+                Token::End(StructureKind::Paragraph),
+            ]
+        );
+        assert_eq!(normalized.token_ranges[3], 6..11);
     }
 
     #[test]
@@ -1002,8 +1079,8 @@ mod tests {
 
         assert_eq!(json["reference"]["document_id"], "reference");
         assert_eq!(json["comparisons"][0]["alternative_id"], "alternative");
-        assert_eq!(substitution["reference_range"]["start"], 3);
-        assert_eq!(substitution["reference_range"]["end"], 4);
+        assert_eq!(substitution["reference_range"]["start"], 4);
+        assert_eq!(substitution["reference_range"]["end"], 5);
         assert_eq!(substitution["reference_source_range"]["start"], 7);
         assert_eq!(substitution["reference_source_range"]["end"], 12);
         assert_eq!(substitution["replacement"][0]["kind"], "Text");
