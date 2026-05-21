@@ -4,6 +4,20 @@
 
 The immediate target is Markdown. The long-term goal is to support additional Markup languages and, where useful, multiple parser backends.
 
+## Installation
+
+```toml
+[dependencies]
+markalign = "0.1"
+```
+
+By default, `markalign` enables Serde support for serializing and deserializing result types. To disable that dependency:
+
+```toml
+[dependencies]
+markalign = { version = "0.1", default-features = false }
+```
+
 ## Why
 
 Raw-text diffs are often a poor fit for Markup documents:
@@ -151,6 +165,21 @@ Examples:
 - If an alternative differs only in a few local edits, the result should be a short list of local substitutions.
 
 The result should also be serializable.
+
+## Feature Flags
+
+- `serde` is enabled by default and adds `Serialize` and `Deserialize` implementations to the public data types.
+
+## Current Limitations
+
+`markalign` is still an early `0.1` crate. The public data model is useful, but not yet mature.
+
+- Only Markdown is supported.
+- Only `pulldown-cmark` is supported as parser backend.
+- Several Markdown-adjacent features are rejected instead of normalized.
+- Diff consolidation is intentionally simple and may not always match human editing intent.
+- The JSON shape is tested, but long-term serialization stability is not guaranteed yet.
+- There is no CLI, renderer, or HTML output layer.
 
 ## Non-Goals For Version 1
 

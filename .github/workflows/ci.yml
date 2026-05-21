@@ -24,5 +24,11 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Run tests without default features
+        run: cargo test --no-default-features
+
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Check package
+        run: cargo package

@@ -3,14 +3,23 @@ name = "markalign"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-3-Clause"
-description = "Planned library for comparing Markdown documents at the syntax level"
+description = "Compare Markdown documents at the syntax level"
+repository = "https://github.com/curoli/markalign"
+readme = "README.md"
+keywords = ["markdown", "diff", "markup", "comparison"]
+categories = ["text-processing", "parsing"]
+exclude = [".github/", ".gitignore"]
 
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
 [dependencies]
 pulldown-cmark = { version = "0.13.4", default-features = false }
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"], optional = true }
 similar = "3.1.0"
 unicode-normalization = "0.1"
 

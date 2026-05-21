@@ -22,12 +22,14 @@ use core::ops::Range;
 use pulldown_cmark::{
     CodeBlockKind, Event, HeadingLevel, Options as MarkdownOptions, Parser, Tag, TagEnd,
 };
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use similar::{Algorithm, DiffTag, capture_diff_slices};
 use unicode_normalization::UnicodeNormalization;
 
 /// One source document provided to `markalign`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Document {
     /// Optional identifier supplied by the caller.
     pub id: Option<String>,
@@ -54,7 +56,8 @@ impl Document {
 }
 
 /// Configuration for parsing, normalization, and consolidation.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Options {
     /// Whether Unicode normalization should be applied before parsing.
     pub normalize_unicode: bool,
@@ -66,8 +69,9 @@ pub struct Options {
 }
 
 /// A normalized syntax token derived from parsed Markdown.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "data")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", content = "data"))]
 pub enum Token {
     Text(String),
     Start(StructureKind),
@@ -76,8 +80,9 @@ pub enum Token {
 }
 
 /// Structural or formatting region markers used in the normalized token stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "data")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", content = "data"))]
 pub enum StructureKind {
     Paragraph,
     Heading { level: u8 },
@@ -93,8 +98,9 @@ pub enum StructureKind {
 }
 
 /// Atomic tokens that do not enclose child content.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "data")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", content = "data"))]
 pub enum AtomKind {
     SoftBreak,
     HardBreak,
@@ -106,7 +112,8 @@ pub enum AtomKind {
 }
 
 /// A normalized document ready for token-level comparison.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct NormalizedDocument {
     pub document_id: Option<String>,
     pub source: String,
@@ -134,7 +141,8 @@ impl NormalizedDocument {
 
 /// One replacement that transforms a region of the reference into a region of
 /// an alternative.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Substitution {
     /// Token range in the reference document to be replaced.
     pub reference_range: Range<usize>,
@@ -163,14 +171,16 @@ impl Substitution {
 }
 
 /// Final result for comparing one alternative document against the reference.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Comparison {
     pub alternative_id: Option<String>,
     pub substitutions: Vec<Substitution>,
 }
 
 /// One source location in a document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SourcePosition {
     pub byte: usize,
     pub line: usize,
@@ -178,7 +188,8 @@ pub struct SourcePosition {
 }
 
 /// A source span with both byte offsets and line/column positions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SourceSpan {
     pub range: Range<usize>,
     pub start: SourcePosition,
@@ -227,15 +238,17 @@ impl<'a> SourceMap<'a> {
 }
 
 /// Full output for one comparison run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ComparisonSet {
     pub reference: NormalizedDocument,
     pub comparisons: Vec<Comparison>,
 }
 
 /// Errors that future parsing, normalization, and comparison steps may report.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "data")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", content = "data"))]
 pub enum Error {
     EmptyInput,
     ParseFailed {
@@ -1050,6 +1063,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "serde")]
     fn comparison_set_round_trips_through_json() {
         let options = Options::default();
         let result = compare_pair(
@@ -1066,6 +1080,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "serde")]
     fn serialized_comparison_uses_stable_field_names() {
         let options = Options::default();
         let result = compare_pair(
