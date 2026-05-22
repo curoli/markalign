@@ -8,14 +8,14 @@ The immediate target is Markdown. The long-term goal is to support additional Ma
 
 ```toml
 [dependencies]
-markalign = "0.1"
+markalign = "0.2"
 ```
 
 By default, `markalign` enables Serde support for serializing and deserializing result types. To disable that dependency:
 
 ```toml
 [dependencies]
-markalign = { version = "0.1", default-features = false }
+markalign = { version = "0.2", default-features = false }
 ```
 
 ## Why
@@ -62,7 +62,7 @@ Anything beyond that should be treated as a later extension, not as part of the 
 
 ## Release Status
 
-`0.1.0` is intended as an early API release. The Rust API follows Cargo's normal pre-1.0 SemVer expectations: breaking changes may still happen in `0.x` minor releases.
+`0.2.0` is intended as an early API release. The Rust API follows Cargo's normal pre-1.0 SemVer expectations: breaking changes may still happen in `0.x` minor releases.
 
 Tokenization details and serialized JSON output are tested, but they are not yet long-term stable formats. Downstream users should treat them as useful integration points for experimentation rather than permanent interchange formats.
 
@@ -201,7 +201,7 @@ The result should also be serializable.
 
 ## Current Limitations
 
-`markalign` is still an early `0.1` crate. The public data model is useful, but not yet mature.
+`markalign` is still an early `0.2` crate. The public data model is useful, but not yet mature.
 
 - Only Markdown is supported.
 - Only `pulldown-cmark` is supported as parser backend.
