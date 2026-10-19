@@ -62,7 +62,9 @@ Anything beyond that should be treated as a later extension, not as part of the 
 
 ## Release Status
 
-`0.2.0` is intended as an early API release. The Rust API follows Cargo's normal pre-1.0 SemVer expectations: breaking changes may still happen in `0.x` minor releases.
+`0.2.1` is intended as an early API release. The Rust API follows Cargo's normal pre-1.0 SemVer expectations: breaking changes may still happen in `0.x` minor releases.
+
+See [CHANGELOG.md](CHANGELOG.md) for fixes and maintenance updates.
 
 Tokenization details and serialized JSON output are tested, but they are not yet long-term stable formats. Downstream users should treat them as useful integration points for experimentation rather than permanent interchange formats.
 
@@ -147,7 +149,7 @@ For higher-level integrations, each comparison also exposes:
 
 If `Options::block_level_changes_only` is enabled, `markalign` emphasizes block-level change regions instead of detailed substitutions.
 
-Block regions are now aligned in two phases: first by structural block identity, then by block content. That lets `markalign` treat small inline edits inside the same paragraph or heading differently from full block replacement.
+Block alignment first matches unchanged block subtrees by kind and normalized content, keeping them aligned across insertions and heading renames. Gaps with equal block counts are compared block by block; other gaps are reported as larger replacements. Nested blocks remain available as anchors, while comparison regions use nonoverlapping subtrees.
 
 For multi-alternative workflows, `ComparisonSet` also exposes:
 
@@ -183,6 +185,7 @@ The final result should make two things available:
 - A normalized representation of the reference document.
 - For each alternative, a list of substitutions that would transform the reference into that alternative.
 - Source ranges for normalized tokens and substitutions, so downstream tooling can map results back to the original Markdown.
+- For decoded text such as entities and escapes, token ranges may cover the entire parser event rather than an exact substring. With Unicode normalization enabled, all ranges refer to the normalized `NormalizedDocument::source`.
 - A source-map-style position model that can convert byte ranges into line and column spans.
 - Serde-compatible data structures for serializing comparison results.
 
