@@ -95,9 +95,9 @@ assert!(comparison.comparisons[0].substitutions.is_empty());
 
 The public API is built around these core types:
 
-- `Document`: one parsed and normalized source document.
+- `Document`: source text and an optional caller-provided identifier.
+- `NormalizedDocument`: parsed syntax tokens and their source ranges.
 - `Token`: one unit in the normalized syntax stream.
-- `Diff`: a token-level comparison between a reference and an alternative.
 - `Substitution`: one contiguous replacement of part of the reference with part of an alternative.
 - `Comparison`: the full result for one reference and one alternative.
 - `ComparisonSet`: the full result for comparing one reference against all alternatives.
@@ -119,7 +119,7 @@ The working idea is:
 
 For example, emphasis, strong emphasis, links, headings, paragraphs, and list items can all be represented by structure tokens plus text tokens.
 
-For `v1`, the parser backend is `pulldown-cmark`, and the normalized token model is intentionally narrower than the full parser event space. Unsupported Markdown-adjacent features such as inline HTML are currently rejected instead of being normalized silently.
+The parser backend is `pulldown-cmark`. Inline and block HTML are preserved as opaque tokens so they can be compared without interpreting their contents.
 
 ## Diff And Consolidation
 
@@ -154,7 +154,7 @@ For multi-alternative workflows, `ComparisonSet` also exposes:
 - `shared_unchanged_regions`
 - `variant_clusters`
 
-These multi-alternative results are now built from a shared block-level alignment pass across the reference and all alternatives. They are no longer just a post-processing layer over already-finished pairwise regions, which makes shared unchanged regions and competing variants more coherent for server-side and UI integration.
+These multi-alternative results combine the block alignments of each alternative against the reference into a shared region summary. This remains reference-based alignment; it does not optimize all documents jointly.
 
 ## Markdown Support
 
@@ -171,11 +171,10 @@ These multi-alternative results are now built from a shared block-level alignmen
 | Code blocks | Partial | Code block structure and fenced language are preserved. |
 | Thematic breaks | Supported | Preserved as an atom token. |
 | Soft and hard breaks | Supported | Preserved as atom tokens. |
-| Inline HTML and block HTML | Rejected | Returns `UnsupportedFeature`. |
 | Footnotes | Supported | Parsed into footnote reference and definition structures. |
 | Math | Supported | Parsed into opaque inline and display math tokens. |
 | Task lists | Supported | Parsed into task marker tokens inside list items. |
-| HTML | Degraded | Preserved as opaque HTML tokens instead of causing comparison failure. |
+| Inline HTML and block HTML | Degraded | Preserved as opaque HTML tokens instead of causing comparison failure. |
 
 ## Output
 
